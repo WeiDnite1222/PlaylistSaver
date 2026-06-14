@@ -1,5 +1,7 @@
+import asyncio
 import base64
 import binascii
+import datetime
 import json
 import logging
 import os
@@ -8,10 +10,12 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from tkinter import messagebox, simpledialog
-from typing import Callable
-
-from PIL import Image, ImageTk
+from typing import Callable, List
+from yt_dlp.networking.common import Request, _REQUEST_HANDLERS, _RH_PREFERENCES
+from PIL import Image
+from bs4 import BeautifulSoup
 import customtkinter as ctk
 import urllib
 from urllib.parse import unquote
@@ -332,14 +336,29 @@ def fetch_playlist_videos(playlist: dict):
 
     opts = get_ydl_opts()
 
-    opts.update({"extract_flat": True,})
+    opts.update({"extract_flat": True,
+                 "skip_download": True,
+                 "quiet": True,})
 
     with fetch_playlist_lock:
-        with YoutubeDL(get_ydl_opts()) as ydl:
+        with YoutubeDL(opts) as ydl:
             data = ydl.extract_info(playlist_url, download=False)
 
     save_playlist_videos(playlist_id, data)
     return data
+
+def fetch_video_details(video_url: str):
+    opts = get_ydl_opts()
+    opts.update({"extract_flat": True,})
+
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+    except Exception as e:
+        logger.error(f"Unable to fetch video details: {e}\nURL:{video_url}")
+        return None
+
+    return info
 
 def resolve_video_page_url(video: dict):
     return (
@@ -426,17 +445,22 @@ def background(url_schema, cookie_file: str, callback: Callable):
         # messagebox.showerror("Error", "No playlists found.")
 
         with fetch_playlist_lock:
+
+            opts = get_ydl_opts()
+            opts.update({
+                'extract_flat': True,
+                'skip_download': True,
+                'quiet': True,
+            })
+
             try:
-                with YoutubeDL(get_ydl_opts()) as ydl:
+                with YoutubeDL(opts) as ydl:
                     data = ydl.extract_info("https://www.youtube.com/feed/playlists", download=False)
+
             except Exception as e:
                 print("An error occurred:", e)
                 pause()
                 sys.exit(-1)
-
-    # print("=== YOUTUBE DATA ===")
-    # print(json.dumps(data, indent=4))
-    # print("=== YOUTUBE DATA ===")
 
     save_json(data, get_profile_playlists_cache_path())
 
@@ -729,9 +753,38 @@ def main(url_schema, cookie_file: str):
             daemon=True,
         ).start()
 
+    class VideoObject:
+        def __init__(self, vid_id, url, title, duration, index, master):
+            self.id = vid_id
+            self.url = url
+            self.title = title
+            self.duration = duration
+
+            self.frame = ctk.CTkFrame(master, border_width=1, border_color="#666666")
+            self.frame.pack(fill="x", padx=5, pady=5)
+
+            self.title_label = ctk.CTkLabel(
+                self.frame,
+                text=f"{index}. {self.title}",
+                wraplength=600,
+                justify="left",
+            ).pack(anchor="w", padx=10, pady=(10, 5))
+
+            self.duration_label = ctk.CTkLabel(
+                self.frame,
+                text=duration,
+                text_color="#aaaaaa",
+            ).pack(anchor="w", padx=10, pady=(0, 10))
+
+            self.thumbnail_label = None
+
+        def apply_thumbnail(self, thumbnail):
+            self.thumbnail_label = ctk.CTkLabel(self.frame, image=thumbnail, text="")
+            self.thumbnail_label.pack(anchor="e", padx=10, pady=(0, 10))
+            self.thumbnail_label.update()
+
     def open_playlist_window(playlist: dict):
         playlist_title = playlist.get("title", "Playlist not found")
-        # playlist_id = playlist.get("id", "unknown")
 
         playlist_window = ctk.CTkToplevel(root)
         playlist_window.title(playlist_title)
@@ -759,28 +812,87 @@ def main(url_schema, cookie_file: str):
 
             entries = [entry for entry in entries if entry is not None]
 
+            videos = []
+
             for index, video in enumerate(entries, start=1):
                 video_title = video.get("title", "Video not found")
-                duration = video.get("duration_string") or "Unknown duration"
 
-                video_item = ctk.CTkFrame(video_frame, border_width=1, border_color="#666666")
-                video_item.pack(fill="x", padx=5, pady=5)
+                if video.get("duration"):
+                    duration = str(datetime.timedelta(seconds=video.get("duration")))
+                else:
+                    duration = "Missing duration data"
 
-                ctk.CTkLabel(
-                    video_item,
-                    text=f"{index}. {video_title}",
-                    wraplength=600,
-                    justify="left",
-                ).pack(anchor="w", padx=10, pady=(10, 5))
+                video_url = resolve_video_page_url(video)
 
-                ctk.CTkLabel(
-                    video_item,
-                    text=duration,
-                    text_color="#aaaaaa",
-                ).pack(anchor="w", padx=10, pady=(0, 10))
+                video_obj = VideoObject(
+                    video.get("id"),
+                    video_url,
+                    video_title,
+                    duration,
+                    index,
+                    video_frame
+                )
+
+                videos.append(video_obj)
 
                 # Open video player (mpv) when video_frame is clicked
-                bind_click_recursive(video_item, lambda _event, current_video=video: open_video_player(current_video))
+                bind_click_recursive(video_obj.frame, lambda _event, current_video=video: open_video_player(current_video))
+
+            threading.Thread(target=video_info_updater, args=(videos,), daemon=True).start()
+
+        sem = asyncio.Semaphore(5)
+
+        # Update video detail to frame after playlist is loaded (make playlist load faster)
+        def video_info_updater(videos: list[VideoObject]):
+            sem = asyncio.Semaphore(5)
+
+            async def inner(video):
+                async with sem:
+                    info = await asyncio.to_thread(fetch_video_details, video.url)
+
+                    if info is None:
+                        root.after(0, lambda: video.duration.configure(text="No data"))
+                        return
+
+                    thumbnails = info.get("thumbnails", [])
+
+                    if not thumbnails:
+                        return
+
+                    thumbnail_url = thumbnails[0].get("url")
+                    thumbnail_resolution = thumbnails[0].get("resolution", "unknown")
+
+                    if not thumbnail_url:
+                        return
+
+                    thumbnail_path = Path(
+                        ROOT_DIR,
+                        "temp",
+                        "thumbnails",
+                        f"thumbnail_{video.id}_{thumbnail_resolution}.jpg"
+                    )
+
+                    if not thumbnail_path.exists():
+                        await asyncio.to_thread(
+                            download_file,
+                            thumbnail_url,
+                            thumbnail_path.as_posix()
+                        )
+
+                    if thumbnail_path.exists():
+                        def apply():
+                            image = Image.open(thumbnail_path.as_posix())
+                            thumbnail = ctk.CTkImage(image, size=(60, 30))
+                            video.apply_thumbnail(thumbnail)
+
+                        root.after(0, apply)
+
+            async def tasker():
+                await asyncio.gather(
+                    *(inner(video) for video in videos)
+                )
+
+            asyncio.run(tasker())
 
         def worker():
             try:
@@ -831,7 +943,7 @@ def main(url_schema, cookie_file: str):
 
             # Don't apply thumbnail if not available
             if thumbnail:
-                thumbnail_label = ctk.CTkLabel(playlist_item, image=thumbnail)
+                thumbnail_label = ctk.CTkLabel(playlist_item, image=thumbnail, text="")
                 thumbnail_label.pack(anchor="e", padx=5, pady=5)
 
             bind_click_recursive(playlist_item, lambda _event, current_playlist=playlist: open_playlist_window(current_playlist))
