@@ -330,6 +330,10 @@ def fetch_playlist_videos(playlist: dict):
     if cached_data:
         return cached_data
 
+    opts = get_ydl_opts()
+
+    opts.update({"extract_flat": True,})
+
     with fetch_playlist_lock:
         with YoutubeDL(get_ydl_opts()) as ydl:
             data = ydl.extract_info(playlist_url, download=False)
@@ -753,6 +757,8 @@ def main(url_schema, cookie_file: str):
                 ctk.CTkLabel(video_frame, text="No videos found.").pack(anchor="w", padx=10, pady=10)
                 return
 
+            entries = [entry for entry in entries if entry is not None]
+
             for index, video in enumerate(entries, start=1):
                 video_title = video.get("title", "Video not found")
                 duration = video.get("duration_string") or "Unknown duration"
@@ -794,6 +800,8 @@ def main(url_schema, cookie_file: str):
             widget.destroy()
 
         playlists = playlists_data.get("entries", [])
+
+        playlists = [playlist for playlist in playlists if playlist is not None] # ignore None item
 
         for playlist in playlists:
             title = playlist.get("title", "Title not found")
