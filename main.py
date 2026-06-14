@@ -753,25 +753,23 @@ def main(url_schema, cookie_file: str):
             daemon=True,
         ).start()
 
-    class VideoObject:
-        def __init__(self, vid_id, url, title, duration, index, master):
+    class VideoObject(ctk.CTkFrame):
+        def __init__(self, vid_id, url, title, duration, index, master, border_width=1, border_color="#666666"):
+            super().__init__(master)
             self.id = vid_id
             self.url = url
             self.title = title
             self.duration = duration
 
-            self.frame = ctk.CTkFrame(master, border_width=1, border_color="#666666")
-            self.frame.pack(fill="x", padx=5, pady=5)
-
             self.title_label = ctk.CTkLabel(
-                self.frame,
+                self,
                 text=f"{index}. {self.title}",
                 wraplength=600,
                 justify="left",
             ).pack(anchor="w", padx=10, pady=(10, 5))
 
             self.duration_label = ctk.CTkLabel(
-                self.frame,
+                self,
                 text=duration,
                 text_color="#aaaaaa",
             ).pack(anchor="w", padx=10, pady=(0, 10))
@@ -779,35 +777,178 @@ def main(url_schema, cookie_file: str):
             self.thumbnail_label = None
 
         def apply_thumbnail(self, thumbnail):
-            self.thumbnail_label = ctk.CTkLabel(self.frame, image=thumbnail, text="")
+            self.thumbnail_label = ctk.CTkLabel(self, image=thumbnail, text="")
             self.thumbnail_label.pack(anchor="e", padx=10, pady=(0, 10))
             self.thumbnail_label.update()
 
+    max_item_in_one_page = 15
+
+    class PlaylistWindow(ctk.CTkToplevel):
+        def __init__(self, title, master):
+            ctk.CTkToplevel.__init__(self, master)
+            self.title = title
+            self.geometry("700x700")
+
+            self.header_label = ctk.CTkLabel(
+                self,
+                text=title,
+                font=("Arial", 20, "bold")
+            )
+            self.header_label.pack(anchor="w", padx=15, pady=(15, 5))
+
+            self.info_label = ctk.CTkLabel(
+                self,
+                text="Loading playlist videos..."
+            )
+            self.info_label.pack(anchor="w", padx=15, pady=(0, 10))
+
+            # Main Area
+            self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
+            self.content_frame.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+
+            # Video List
+            self.video_frame = ctk.CTkScrollableFrame(self.content_frame)
+            self.video_frame.pack(
+                side="left",
+                fill="both",
+                expand=True
+            )
+
+            # Control Panel
+            self.operate_frame = ctk.CTkFrame(
+                self.content_frame,
+                width=180
+            )
+            self.operate_frame.pack(
+                side="right",
+                fill="y",
+                padx=(10, 0)
+            )
+
+            self.operate_frame.pack_propagate(False)
+
+            self.current_page_label = ctk.CTkLabel(
+                self.operate_frame,
+                text="Page Unloaded"
+            )
+            self.current_page_label.pack(pady=(15, 5))
+
+            self.current_length_label = ctk.CTkLabel(
+                self.operate_frame,
+                text="Counting..."
+            )
+            self.current_length_label.pack(pady=(0, 15))
+
+            self.go_page_btn_frame = ctk.CTkFrame(
+                self.operate_frame,
+                fg_color="transparent"
+            )
+            self.go_page_btn_frame.pack(side="bottom", pady=15)
+
+            self.previous_page_btn = ctk.CTkButton(
+                self.go_page_btn_frame,
+                text="◀",
+                width=50,
+                height=40,
+                command=self.previous_page
+            )
+            self.previous_page_btn.configure(state="disabled")
+
+            self.next_page_btn = ctk.CTkButton(
+                self.go_page_btn_frame,
+                text="▶",
+                width=50,
+                height=40,
+                command=self.next_page
+            )
+
+            self.previous_page_btn.grid(row=0, column=0, padx=5)
+            self.next_page_btn.grid(row=0, column=1, padx=5)
+
+            self.pages = []
+            self.inited = False
+            self.current_page = 0
+
+            self.video_updater = None
+
+            self.thread_pool = []
+
+            self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        def load_page(self, page):
+            if len(self.pages) < page+1 or (self.current_page == page and self.inited):
+                return
+
+            if not self.inited:
+                self.inited = True
+
+            videos: List[VideoObject] = self.pages[page]
+
+            # Remove old items
+            for item in self.video_frame.winfo_children():
+                item.pack_forget()
+
+            for video in videos:
+                video.pack(fill="x", padx=5, pady=5)
+
+            self.current_length_label.configure(text=f"Total: {len(videos)}")
+            self.current_page_label.configure(text=f"Page {self.current_page+1}")
+
+            if self.video_updater:
+                thread = threading.Thread(target=self.video_updater, args=(videos,))
+                self.thread_pool.append(thread)
+                thread.start()
+
+        def handle_page_switcher(self):
+            if self.current_page == 0:
+                self.previous_page_btn.configure(state="disabled")
+            else:
+                self.previous_page_btn.configure(state="normal")
+
+            if self.current_page == len(self.pages)-1:
+                self.next_page_btn.configure(state="disabled")
+            else:
+                self.next_page_btn.configure(state="normal")
+
+        def previous_page(self):
+            if self.current_page-1 > len(self.pages)-1 or self.current_page-1 < 0:
+                return
+
+            self.load_page(self.current_page-1)
+            self.current_page -= 1
+            self.handle_page_switcher()
+
+        def next_page(self):
+            if self.current_page+1 > len(self.pages)-1 or self.current_page+1 < 0:
+                return
+
+            self.load_page(self.current_page+1)
+            self.current_page += 1
+            self.handle_page_switcher()
+
+        def on_close(self):
+            for thread in self.thread_pool:
+                if thread.is_alive():
+                    thread.stop()
+
+            self.destroy()
+
+
     def open_playlist_window(playlist: dict):
-        playlist_title = playlist.get("title", "Playlist not found")
-
-        playlist_window = ctk.CTkToplevel(root)
-        playlist_window.title(playlist_title)
-        playlist_window.geometry("700x600")
-
-        header_label = ctk.CTkLabel(playlist_window, text=playlist_title)
-        header_label.pack(anchor="w", padx=15, pady=(15, 10))
-
-        info_label = ctk.CTkLabel(playlist_window, text="Loading playlist videos...")
-        info_label.pack(anchor="w", padx=15, pady=(0, 10))
-
-        video_frame = ctk.CTkScrollableFrame(playlist_window)
-        video_frame.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        window = PlaylistWindow(
+            playlist["title"],
+            root
+        )
 
         def render_videos(playlist_data):
-            for widget in video_frame.winfo_children():
+            for widget in window.video_frame.winfo_children():
                 widget.destroy()
 
             entries = playlist_data.get("entries") or []
-            info_label.configure(text=f"{len(entries)} videos")
+            window.info_label.configure(text=f"{len(entries)} videos")
 
             if not entries:
-                ctk.CTkLabel(video_frame, text="No videos found.").pack(anchor="w", padx=10, pady=10)
+                ctk.CTkLabel(window.video_frame, text="No videos found.").pack(anchor="w", padx=10, pady=10)
                 return
 
             entries = [entry for entry in entries if entry is not None]
@@ -830,17 +971,17 @@ def main(url_schema, cookie_file: str):
                     video_title,
                     duration,
                     index,
-                    video_frame
+                    window.video_frame
                 )
 
                 videos.append(video_obj)
 
                 # Open video player (mpv) when video_frame is clicked
-                bind_click_recursive(video_obj.frame, lambda _event, current_video=video: open_video_player(current_video))
+                bind_click_recursive(video_obj, lambda _event, current_video=video: open_video_player(current_video))
 
-            threading.Thread(target=video_info_updater, args=(videos,), daemon=True).start()
+            window.pages = [videos[i:i + max_item_in_one_page] for i in range(0, len(videos), max_item_in_one_page)]
+            window.load_page(0)
 
-        sem = asyncio.Semaphore(5)
 
         # Update video detail to frame after playlist is loaded (make playlist load faster)
         def video_info_updater(videos: list[VideoObject]):
@@ -851,7 +992,7 @@ def main(url_schema, cookie_file: str):
                     info = await asyncio.to_thread(fetch_video_details, video.url)
 
                     if info is None:
-                        root.after(0, lambda: video.duration.configure(text="No data"))
+                        root.after(0, lambda: video.duration_label.configure(text="No data"))
                         return
 
                     thumbnails = info.get("thumbnails", [])
@@ -882,7 +1023,7 @@ def main(url_schema, cookie_file: str):
                     if thumbnail_path.exists():
                         def apply():
                             image = Image.open(thumbnail_path.as_posix())
-                            thumbnail = ctk.CTkImage(image, size=(60, 30))
+                            thumbnail = ctk.CTkImage(image, size=(150, 85))
                             video.apply_thumbnail(thumbnail)
 
                         root.after(0, apply)
@@ -899,12 +1040,13 @@ def main(url_schema, cookie_file: str):
                 playlist_data = fetch_playlist_videos(playlist)
             except Exception as e:
                 logger.error("Unable to load playlist videos: %s", e)
-                playlist_window.after(0, lambda: info_label.configure(text=f"Unable to load playlist: {e}"))
+                window.after(0, lambda: window.info_label.configure(text=f"Unable to load playlist: {e}"))
                 return
 
-            playlist_window.after(0, lambda: render_videos(playlist_data))
+            window.after(0, lambda: render_videos(playlist_data))
 
         threading.Thread(target=worker, daemon=True).start()
+        window.video_updater = video_info_updater
 
     # Load playlist when background thread finished playlists data fetch process
     def build_ui(playlists_data):
