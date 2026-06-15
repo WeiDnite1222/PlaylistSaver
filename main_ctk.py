@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import datetime
 import json
 import logging
@@ -13,19 +15,20 @@ from tkinter import messagebox, simpledialog
 from typing import Callable, List
 from PIL import Image
 import customtkinter as ctk
+import urllib
+from urllib.parse import unquote
 import click
 import requests
+import winreg
 from yt_dlp import YoutubeDL
-from utils import save_json, read_json, check_url_scheme, parser_url_scheme
 
-VERSION = "Alpha-2-QtTest"
-ROOT_DIR = Path.cwd()
+VERSION = "Prototype"
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 save_path = os.path.join(ROOT_DIR, "save")
 temp_path = os.path.join(ROOT_DIR, "temp")
 profiles_path = os.path.join(save_path, "profiles")
 profiles_meta_path = os.path.join(save_path, "profiles.json")
-
 DEFAULT_PROFILE_NAME = "default"
 active_profile_name = DEFAULT_PROFILE_NAME
 cookie_path = os.path.join(profiles_path, DEFAULT_PROFILE_NAME, "cookies.txt")
@@ -34,8 +37,58 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 fetch_playlist_lock = threading.Lock()
-mpv_processes: dict[ctk.CTkToplevel, subprocess.Popen] = {}
+mpv_processes = {}
 download_playlists_lock = threading.Lock()
+
+def key_exists(hive, sub_key):
+    try:
+        # Attempt to open the key for reading
+        with winreg.OpenKey(hive, sub_key, 0, winreg.KEY_READ) as key:
+            return True
+    except FileNotFoundError:
+        return False
+
+def create_url_scheme():
+    try:
+        scheme = "PlaylistSaver"
+        base = r"Software\Classes\\" + scheme
+
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, base)
+
+        winreg.SetValueEx(key, None, 0, winreg.REG_SZ, f"URL:{scheme} Protocol")
+        winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
+
+        shell_key = winreg.CreateKey(key, "shell")
+        open_key = winreg.CreateKey(shell_key, "open")
+        command_key = winreg.CreateKey(open_key, "command")
+
+        if getattr(sys, 'frozen', False):
+            command = f"\"{sys.executable}\" \"%1\""
+        else:
+            command = f"\"{sys.executable}\" \"{os.path.abspath(__file__)}\" \"%1\""
+
+        winreg.SetValueEx(command_key, None, 0, winreg.REG_SZ, command)
+
+        logger.info("URL scheme registered.")
+
+    except OSError as e:
+        logger.error("Unable to create URL scheme:", e)
+
+def check_url_scheme():
+    try:
+        if not key_exists(winreg.HKEY_LOCAL_MACHINE, "PlaylistSaver"):
+            create_url_scheme()
+    except FileNotFoundError:
+        create_url_scheme()
+
+def read_cookies():
+    try:
+        with open(cookie_path, "r", encoding='utf-8') as f:
+            return f.read()
+    except FileNotFoundError:
+        logger.error("Cookies file not found.")
+    except Exception as e:
+        logger.error("An unexpected error occurred while reading cookies:", e)
 
 def load_profiles_meta():
     meta = read_json(profiles_meta_path)
@@ -120,6 +173,14 @@ def get_cookie_owner():
 
     print("Cookie owner: ", json.dumps(data, indent=2))
 
+def save_cookies(cookies):
+    try:
+        os.makedirs(os.path.dirname(cookie_path), exist_ok=True)
+        with open(cookie_path, "w", encoding='utf-8') as f:
+            f.write(cookies)
+    except Exception as e:
+        logger.error("An unexpected error occurred while saving cookies:", e)
+
 def cookie_string_to_netscape(cookie_str):
     lines = ["# Netscape HTTP Cookie File"]
 
@@ -141,6 +202,56 @@ def cookie_string_to_netscape(cookie_str):
         ]))
 
     return "\n".join(lines)
+
+def pause():
+    input("Press enter to continue...")
+
+def save_base64_netscape_cookie(cookies_encoded):
+    try:
+        cookies = base64.b64decode(cookies_encoded).decode("utf-8")
+    except binascii.Error:
+        print("Unable to decode base64 cookie:", cookies_encoded)
+        return None
+
+    print("==== COOKIE FILE ====")
+    for line in cookies.split("\n"):
+        print(line, "=>", len(line.split("\t")))
+    print("=====================")
+
+    save_cookies(cookies)
+
+def parser_url_scheme(url):
+    print("Parsing URL scheme:", url)
+
+    url = urllib.parse.urlparse(unquote(sys.argv[1]))
+    parameters = urllib.parse.parse_qs(url.query)
+
+    func_map = {
+        "base64cookies": save_base64_netscape_cookie,
+    }
+
+    for arg_name in parameters:
+        match_func = func_map.get(arg_name, None)
+        if match_func:
+            match_func(parameters[arg_name][0])
+        else:
+            print("Unknown parameter:", arg_name, " Value:", parameters[arg_name])
+
+def save_json(data: dict, dest):
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        logger.error("Unable to save json:", e)
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error("Unable to read json:", e)
+
 
 def load_playlists():
     playlists_path = get_profile_playlists_cache_path()
@@ -272,7 +383,7 @@ def play_video_with_mpv(video_url: str, window: ctk.CTkToplevel, status_label: c
     mpv_path = resolve_mpv_path()
 
     if not mpv_path:
-        window.after(0, lambda label=status_label: label.configure(text="mpv not found in bin/ or PATH."))
+        window.after(0, lambda: status_label.configure(text="mpv not found in bin/ or PATH."))
         return
 
     try:
@@ -284,11 +395,11 @@ def play_video_with_mpv(video_url: str, window: ctk.CTkToplevel, status_label: c
         )
     except Exception as e:
         logger.error("Unable to start mpv: %s", e)
-        window.after(0, lambda label=status_label: label.configure(text=f"Unable to start mpv: {e}"))
+        window.after(0, lambda: status_label.configure(text=f"Unable to start mpv: {e}"))
         return
 
     mpv_processes[window] = process
-    window.after(0, lambda label=status_label: label.configure(text="Playing in mpv..."))
+    window.after(0, lambda: status_label.configure(text="Playing in mpv..."))
 
     process.wait()
 
@@ -297,7 +408,7 @@ def play_video_with_mpv(video_url: str, window: ctk.CTkToplevel, status_label: c
         if window.winfo_exists():
             status_label.configure(text="Playback finished.")
 
-    window.after(0, lambda func=on_finish: func())
+    window.after(0, on_finish)
 
 def download_file(url, dest):
     try:
@@ -318,7 +429,7 @@ def background(url_schema, cookie_file: str, callback: Callable):
 
     if url_schema is not None:
         try:
-            parser_url_scheme(url_schema, work_dir=ROOT_DIR)
+            parser_url_scheme(url_schema)
         except Exception as e:
             logger.error("Unable to parse URL scheme:", e)
             input("Press enter to continue...")
@@ -329,7 +440,10 @@ def background(url_schema, cookie_file: str, callback: Callable):
     data = load_playlists()
 
     if not data:
+        # messagebox.showerror("Error", "No playlists found.")
+
         with fetch_playlist_lock:
+
             opts = get_ydl_opts()
             opts.update({
                 'extract_flat': True,
@@ -342,8 +456,8 @@ def background(url_schema, cookie_file: str, callback: Callable):
                     data = ydl.extract_info("https://www.youtube.com/feed/playlists", download=False)
 
             except Exception as e:
-                logger.error("An error occurred:", e)
-                messagebox.showerror("Error", f"Unable to fetch playlists: {e}")
+                print("An error occurred:", e)
+                pause()
                 sys.exit(-1)
 
     save_json(data, get_profile_playlists_cache_path())
@@ -360,7 +474,7 @@ def main(url_schema, cookie_file: str):
 
     def on_data_ready(data):
         current_playlists_data["entries"] = data.get("entries", [])
-        root.after(0, lambda func=build_ui: func(data))
+        root.after(0, lambda: build_ui(data))
 
     # CTk
     root = ctk.CTk()
@@ -399,7 +513,7 @@ def main(url_schema, cookie_file: str):
         profile_label.configure(text=f"Current Profile: {get_active_profile_name()}")
 
     def update_download_status(message: str):
-        root.after(0, lambda label=download_status_label: label.configure(text=message))
+        root.after(0, lambda: download_status_label.configure(text=message))
 
     def reload_playlists(current_url_schema=None, current_cookie_file=None):
         for widget in playlist_frame.winfo_children():
@@ -577,7 +691,7 @@ def main(url_schema, cookie_file: str):
                     f"Failed: {failed_count}"
                 )
                 update_download_status(finished_message)
-                root.after(0, lambda btn=batch_download_btn: btn.configure(state="normal"))
+                root.after(0, lambda: batch_download_btn.configure(state="normal"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -876,7 +990,7 @@ def main(url_schema, cookie_file: str):
                     info = await asyncio.to_thread(fetch_video_details, video.url)
 
                     if info is None:
-                        root.after(0, lambda v=video: v.duration_label.configure(text="No data"))
+                        root.after(0, lambda: video.duration_label.configure(text="No data"))
                         return
 
                     thumbnails = info.get("thumbnails", [])
@@ -910,7 +1024,7 @@ def main(url_schema, cookie_file: str):
                             thumbnail = ctk.CTkImage(image, size=(150, 85))
                             video.apply_thumbnail(thumbnail)
 
-                        root.after(0, lambda func=apply: func())
+                        root.after(0, apply)
 
             async def tasker():
                 await asyncio.gather(
@@ -924,10 +1038,10 @@ def main(url_schema, cookie_file: str):
                 playlist_data = fetch_playlist_videos(playlist)
             except Exception as e:
                 logger.error("Unable to load playlist videos: %s", e)
-                window.after(0, lambda w=window: w.info_label.configure(text=f"Unable to load playlist: {e}"))
+                window.after(0, lambda: window.info_label.configure(text=f"Unable to load playlist: {e}"))
                 return
 
-            window.after(0, lambda func=render_videos: func(playlist_data))
+            window.after(0, lambda: render_videos(playlist_data))
 
         threading.Thread(target=worker, daemon=True).start()
         window.video_updater = video_info_updater
