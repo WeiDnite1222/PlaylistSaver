@@ -1,4 +1,4 @@
-import asyncio
+import copy
 import datetime
 import json
 import logging
@@ -7,236 +7,44 @@ import shutil
 import subprocess
 import sys
 import threading
-import time
+import traceback
+import webbrowser
 from pathlib import Path
-from tkinter import messagebox, simpledialog
-from typing import Callable, List
-from PIL import Image
-import customtkinter as ctk
+from yt_dlp.networking.exceptions import HTTPError
+from typing import Callable
 import click
 import requests
 from yt_dlp import YoutubeDL
-from utils import save_json, read_json, check_url_scheme, parser_url_scheme
+from utils import save_json, read_json, check_url_scheme, parser_url_scheme, find_mpv_path, find_http_status
+
+# Qt
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QDialog,
+    QLabel, QPushButton, QFrame, QScrollArea,
+    QVBoxLayout, QHBoxLayout, QGridLayout,
+    QMessageBox, QInputDialog, QSizePolicy, QFileDialog,
+)
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize, QUrl
+from PySide6.QtGui import QPixmap, QFont, QImage, QIcon, QDesktopServices
 
 VERSION = "Alpha-2-QtTest"
-ROOT_DIR = Path.cwd()
+PROGRAM_DIR = Path(__file__).parent
 
-save_path = os.path.join(ROOT_DIR, "save")
-temp_path = os.path.join(ROOT_DIR, "temp")
-profiles_path = os.path.join(save_path, "profiles")
-profiles_meta_path = os.path.join(save_path, "profiles.json")
-
-DEFAULT_PROFILE_NAME = "default"
-active_profile_name = DEFAULT_PROFILE_NAME
-cookie_path = os.path.join(profiles_path, DEFAULT_PROFILE_NAME, "cookies.txt")
+work_dir = None
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-fetch_playlist_lock = threading.Lock()
-mpv_processes: dict[ctk.CTkToplevel, subprocess.Popen] = {}
-download_playlists_lock = threading.Lock()
-
-def load_profiles_meta():
-    meta = read_json(profiles_meta_path)
-    if not meta:
-        return {
-            "active_profile": DEFAULT_PROFILE_NAME,
-            "profiles": [DEFAULT_PROFILE_NAME],
-        }
-
-    profiles = meta.get("profiles") or [DEFAULT_PROFILE_NAME]
-    active_profile = meta.get("active_profile") or profiles[0]
-
-    if active_profile not in profiles:
-        profiles.insert(0, active_profile)
-
-    return {
-        "active_profile": active_profile,
-        "profiles": profiles,
-    }
-
-def save_profiles_meta(meta: dict):
-    save_json(meta, profiles_meta_path)
-
-def get_profile_dir(profile_name: str):
-    return os.path.join(profiles_path, sanitize_filename(profile_name))
-
-def get_profile_cookie_path(profile_name: str):
-    return os.path.join(get_profile_dir(profile_name), "cookies.txt")
-
-def get_active_profile_name():
-    global active_profile_name
-
-    meta = load_profiles_meta()
-    active_profile_name = meta["active_profile"]
-    return active_profile_name
-
-def set_active_profile(profile_name: str):
-    global active_profile_name, cookie_path
-
-    meta = load_profiles_meta()
-    profiles = meta["profiles"]
-
-    if profile_name not in profiles:
-        profiles.append(profile_name)
-
-    meta["profiles"] = profiles
-    meta["active_profile"] = profile_name
-    save_profiles_meta(meta)
-
-    active_profile_name = profile_name
-    cookie_path = get_profile_cookie_path(profile_name)
-    os.makedirs(os.path.dirname(cookie_path), exist_ok=True)
-
-def ensure_profile_exists(profile_name: str):
-    meta = load_profiles_meta()
-    profiles = meta["profiles"]
-
-    if profile_name not in profiles:
-        profiles.append(profile_name)
-        meta["profiles"] = profiles
-        save_profiles_meta(meta)
-
-    os.makedirs(get_profile_dir(profile_name), exist_ok=True)
-
-def initialize_profiles():
-    os.makedirs(profiles_path, exist_ok=True)
-    active_name = get_active_profile_name()
-    ensure_profile_exists(active_name)
-    set_active_profile(active_name)
-
-def get_cookie_owner():
-    ydl_opts = {
-        'cookiefile': cookie_path,
-        'verbose': True,
-    }
-
-    with YoutubeDL(ydl_opts) as ydl:
-        data = ydl.extract_info(
-            "https://www.youtube.com/feed/subscriptions",
-            download=False
-        )
-
-    print("Cookie owner: ", json.dumps(data, indent=2))
-
-def cookie_string_to_netscape(cookie_str):
-    lines = ["# Netscape HTTP Cookie File"]
-
-    for pair in cookie_str.split(";"):
-        pair = pair.strip()
-        if not pair or "=" not in pair:
-            continue
-
-        name, value = pair.split("=", 1)  # ← 關鍵修正
-
-        lines.append("\t".join([
-            ".youtube.com",
-            "TRUE",
-            "/",
-            "TRUE",
-            "9999999999",
-            name.strip(),
-            value.strip()
-        ]))
-
-    return "\n".join(lines)
-
-def load_playlists():
-    playlists_path = get_profile_playlists_cache_path()
-
-    if not os.path.exists(playlists_path):
-        logger.error("Playlists file not found.")
-        return None
-
-    return read_json(playlists_path)
-
-def get_ydl_opts():
-    return {
-        'cookiefile': cookie_path,
-        'verbose': True,
-        'download': False,
-        'js_runtimes': {"node": {}},
-        'extract_flat': False,
-        'lazy_playlist': False,
-        "ignoreerrors": True
-    }
-
-def get_profile_temp_dir(profile_name: str | None = None):
-    profile_name = profile_name or active_profile_name
-    return os.path.join(temp_path, sanitize_filename(profile_name))
-
-def get_profile_playlists_cache_path(profile_name: str | None = None):
-    return os.path.join(get_profile_temp_dir(profile_name), "cache-playlists.json")
+YT_PLAYLISTS_URL = "https://www.youtube.com/feed/playlists"
 
 def sanitize_filename(value: str):
     invalid_chars = '<>:"/\\|?*'
     return "".join("_" if char in invalid_chars else char for char in value)
 
-def get_playlist_cache_path(playlist_id: str):
-    safe_id = sanitize_filename(playlist_id or "unknown")
-    return os.path.join(get_profile_temp_dir(), "playlists", f"{safe_id}.json")
 
-def get_playlist_batch_progress_path():
-    return os.path.join(get_profile_temp_dir(), "playlist-download-progress.json")
-
-def load_playlist_batch_progress():
-    progress_path = get_playlist_batch_progress_path()
-    if os.path.exists(progress_path):
-        return read_json(progress_path)
-
-    return {
-        "profile": get_active_profile_name(),
-        "completed_ids": [],
-        "failed": [],
-        "last_index": -1,
-        "updated_at": None,
-    }
-
-def save_playlist_batch_progress(progress: dict):
-    progress["profile"] = get_active_profile_name()
-    progress["updated_at"] = int(time.time())
-    save_json(progress, get_playlist_batch_progress_path())
-
-def load_playlist_videos(playlist_id: str):
-    cache_path = get_playlist_cache_path(playlist_id)
-    if os.path.exists(cache_path):
-        return read_json(cache_path)
-    return None
-
-def save_playlist_videos(playlist_id: str, data: dict):
-    save_json(data, get_playlist_cache_path(playlist_id))
-
-def fetch_playlist_videos(playlist: dict):
-    playlist_id = playlist.get("id")
-    playlist_url = playlist.get("url") or playlist.get("webpage_url")
-
-    if not playlist_url and playlist_id and not str(playlist_id).startswith("VL"):
-        playlist_url = f"https://www.youtube.com/playlist?list={playlist_id}"
-
-    if not playlist_url:
-        raise ValueError("Playlist URL not found.")
-
-    cached_data = load_playlist_videos(playlist_id)
-    if cached_data:
-        return cached_data
-
-    opts = get_ydl_opts()
-
-    opts.update({"extract_flat": True,
-                 "skip_download": True,
-                 "quiet": True,})
-
-    with fetch_playlist_lock:
-        with YoutubeDL(opts) as ydl:
-            data = ydl.extract_info(playlist_url, download=False)
-
-    save_playlist_videos(playlist_id, data)
-    return data
-
-def fetch_video_details(video_url: str):
-    opts = get_ydl_opts()
-    opts.update({"extract_flat": True,})
+def fetch_video_details(video_url: str, opts):
+    opts = copy.deepcopy(opts)
+    opts.update({"extract_flat": True, })
 
     try:
         with YoutubeDL(opts) as ydl:
@@ -247,735 +55,1325 @@ def fetch_video_details(video_url: str):
 
     return info
 
+
 def resolve_video_page_url(video: dict):
     return (
-        video.get("webpage_url")
-        or video.get("url")
-        or (f"https://www.youtube.com/watch?v={video.get('id')}" if video.get("id") else None)
+            video.get("webpage_url")
+            or video.get("url")
+            or (f"https://www.youtube.com/watch?v={video.get('id')}" if video.get("id") else None)
     )
 
-def resolve_mpv_path():
-    local_candidates = [
-        os.path.join(ROOT_DIR, "bin", "mpv.exe"),
-        os.path.join(ROOT_DIR, "bin", "mpv.com"),
-        os.path.join(ROOT_DIR, "bin", "mpv"),
-    ]
 
-    for candidate in local_candidates:
-        if os.path.exists(candidate):
-            return candidate
-
-    # failback to PATH mpv (if available)
-    return shutil.which("mpv")
-
-def play_video_with_mpv(video_url: str, window: ctk.CTkToplevel, status_label: ctk.CTkLabel):
-    mpv_path = resolve_mpv_path()
-
-    if not mpv_path:
-        window.after(0, lambda label=status_label: label.configure(text="mpv not found in bin/ or PATH."))
-        return
-
+def download_file(url, dest: Path):
     try:
-        process = subprocess.Popen(
-            [mpv_path, video_url],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except Exception as e:
-        logger.error("Unable to start mpv: %s", e)
-        window.after(0, lambda label=status_label: label.configure(text=f"Unable to start mpv: {e}"))
-        return
-
-    mpv_processes[window] = process
-    window.after(0, lambda label=status_label: label.configure(text="Playing in mpv..."))
-
-    process.wait()
-
-    def on_finish():
-        mpv_processes.pop(window, None)
-        if window.winfo_exists():
-            status_label.configure(text="Playback finished.")
-
-    window.after(0, lambda func=on_finish: func())
-
-def download_file(url, dest):
-    try:
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        dest.parent.mkdir(parents=True, exist_ok=True)
         with requests.get(url, stream=True) as r:
-            with open(dest, "wb") as f:
+            with dest.open(mode="wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
         return True
     except Exception as e:
-        logger.error("Unable to download file:", e)
+        logger.error("Unable to download file: %s", e)
         return False
 
-def background(url_schema, cookie_file: str, callback: Callable):
-    global cookie_path
-    check_url_scheme()
-    initialize_profiles()
+
+fetch_playlist_lock = threading.Lock()
+
+class PlaylistFetchException(Exception):
+    def __init__(self, url, title, reason, enable_option=False, options=None, no_cancel=False):
+        super().__init__()
+        self.url = url
+        self.title = title
+        self.reason = reason
+        self.qt_options = {
+            "enable": enable_option,
+            "options": options,
+            "noCancelOption": no_cancel,
+        }
+
+    def create_messagebox(self, master):
+        box = QMessageBox(master)
+        box.setWindowTitle(self.title)
+        box.setText(self.reason or self.title)
+        box.setIcon(QMessageBox.Icon.Critical)
+
+        is_custom_option_enabled = self.qt_options["enable"] is True and type(self.qt_options["options"]) is list
+
+        if is_custom_option_enabled:
+            for option in self.qt_options["options"]:
+                label = option.get("label", None)
+                action_func = option.get("action", None)
+                role = option.get("role", QMessageBox.ButtonRole.AcceptRole)
+
+                # Some type check
+                if label is None or (action_func is None or not callable(action_func)):
+                    logger.warning(f"Skipping {option} ({action_func}) because its label or action is not set yet or not callable.")
+                    continue
+
+                if not isinstance(role, QMessageBox.ButtonRole):
+                    logger.warning(f"Skipping {option} ({role}) because its role type is not QMessageBox.ButtonRole.")
+                    continue
+
+                btn = box.addButton(label, role)
+                option["button"] = btn
+
+        if not self.qt_options["noCancelOption"]:
+            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        elif not is_custom_option_enabled:
+            box.addButton(QMessageBox.StandardButton.Ok)
+
+        box.exec()
+
+        clicked = box.clickedButton()
+
+        # If the option's button is clicked, Call the target action function
+        if is_custom_option_enabled:
+            for option in self.qt_options["options"]:
+                btn = option.get("button")
+                action_func = option.get("action")
+
+                if clicked == btn:
+                    return action_func()
+
+        return None
+
+def fetch_playlists_data(url_schema, cookie_file_path: Path, opts, callback: Callable):
+    check_url_scheme(os.path.abspath(__file__), work_dir)
+
+    error = None
 
     if url_schema is not None:
         try:
-            parser_url_scheme(url_schema, work_dir=ROOT_DIR)
+            parser_url_scheme(url_schema, cookie_path=cookie_file_path)
         except Exception as e:
-            logger.error("Unable to parse URL scheme:", e)
+            logger.error("Unable to parse URL scheme: %s", e)
             input("Press enter to continue...")
 
-    if cookie_file is not None:
-        cookie_path = cookie_file
+    playlists_data = None
 
-    data = load_playlists()
+    with fetch_playlist_lock:
+        opts = copy.deepcopy(opts)
+        opts.update({
+            'extract_flat': True,
+            'skip_download': True,
+        })
 
-    if not data:
+        try:
+            with YoutubeDL(opts) as ydl:
+                playlists_data = ydl.extract_info(YT_PLAYLISTS_URL, download=False)
+        except Exception as e:
+            status_code = find_http_status(e)
+            if status_code == 401:
+                error = "Cookie are expired. Reopen the tool again in browser!", None
+            elif status_code == 403:
+                error = "Server forbidden. Did you logged in?", None
+            elif status_code == 429:
+                error = "Too many requests. Try again later.", None
+            elif status_code == 503:
+                error = "Server unavailable. Try again later.", None
+            elif status_code == 522:
+                error = "Connection timed out.", None
+            else:
+                error = (f"Unexpected error: {e} (Type: {type(e)})\n"
+                         f"Traceback: {traceback.format_exc()}", None)
+
+    if playlists_data is None:
+        logger.error(f"Unable to fetch playlists: {error}")
+        playlists_data = {"entries": []}
+
+    pf_exec = None
+    if error is not None:
+        reason = error[0] if isinstance(error, tuple) else error
+        pf_exec = PlaylistFetchException(
+            url=YT_PLAYLISTS_URL,
+            title="Playlists Fetch Error",
+            reason=reason,
+            enable_option=True,
+            options=[
+                {"label": "Reopen browser",
+                 "action": lambda: webbrowser.open(YT_PLAYLISTS_URL)},
+            ],
+        )
+
+    callback(playlists_data, pf_exec)
+
+
+class PlaylistSaver(QApplication):
+    DEFAULT_PROFILE_NAME = "default"
+    THUMBNAIL_SIZE = QSize(144, 81)
+    mpv_processes = {}
+
+    def __init__(self, url_schema=None, cookie_file: str | None = None):
+        super().__init__()
+        self.setApplicationName("PlaylistSaver")
+
+        self.url_schema = url_schema
+        self.cookie_file = cookie_file
+
+        # Path
+        self.save_path = Path(work_dir, "save")
+        self.temp_path = Path(work_dir, "temp")
+        self.profiles_meta_path = Path(self.save_path, "profiles.json")
+        self.profiles_path = Path(self.save_path, "profiles")
+        self.cookie_path = Path(self.profiles_path, self.DEFAULT_PROFILE_NAME, "cookies.txt")
+
+        # Profile
+        self.active_profile_name = self.DEFAULT_PROFILE_NAME
+
+        # Data
+        self.playlists: dict[str, list] = {
+            "entries": []
+        }
+
+        self.window = self.MainWindow(self)
+
+        self.init()
+        self.window.show()
+
+    class MainWindow(QMainWindow):
+        def __init__(self, parent):
+            super().__init__()
+            self.parent = parent
+            self.child_windows = []
+            self.setWindowTitle("PlaylistSaver")
+            self.resize(700, 800)
+
+            # Central widget
+            self.central_widget = QWidget(self)
+            self.setCentralWidget(self.central_widget)
+
+            # Layouts
+            self.main_layout = QHBoxLayout(self.central_widget)
+            self.main_layout.setContentsMargins(12, 12, 12, 12)
+            self.main_layout.setSpacing(12)
+
+            self.right_layout = QVBoxLayout()
+            self.right_layout.setContentsMargins(12, 12, 12, 12)
+            self.right_layout.setSpacing(10)
+
+            self.playlists_layout = QVBoxLayout()
+            self.playlists_layout.setContentsMargins(10, 10, 10, 10)
+            self.playlists_layout.setSpacing(8)
+
+            # Frame
+            self.playlists_scroll = QScrollArea(self)
+            self.playlists_scroll.setWidgetResizable(True)
+            self.playlists_scroll.setFrameShape(QFrame.NoFrame)
+
+            self.playlists_frame = QFrame(self.playlists_scroll)
+            self.playlists_frame.setLayout(self.playlists_layout)
+            self.playlists_scroll.setWidget(self.playlists_frame)
+
+            self.playlists_scroll.setMinimumWidth(400)
+
+            self.right_panel = QFrame(self.central_widget)
+            self.right_panel.setObjectName("rightPanel")
+            self.right_panel.setFixedWidth(190)
+            self.right_panel.setLayout(self.right_layout)
+
+            # Items
+            self.profile_label = QLabel(f"Current Profile: {self.parent.get_active_profile_name()}",)
+            self.profile_label.setObjectName("profileLabel")
+            self.profile_label.setWordWrap(True)
+
+            self.loading_label = QLabel("Loading...")
+            self.loading_label.setObjectName("loadingLabel")
+            self.loading_label.setAlignment(Qt.AlignCenter)
+
+            self.switch_profile_btn = QPushButton("Switch Profile")
+            self.refresh_playlists_btn = QPushButton("Refresh playlists")
+            self.switch_profile_btn.setMinimumHeight(34)
+            self.refresh_playlists_btn.setMinimumHeight(34)
+
+            self.version_label = QLabel(f"v{VERSION}")
+            self.version_label.setObjectName("versionLabel")
+
+            self.playlist_items_layout = QVBoxLayout()
+            self.playlist_items_layout.setContentsMargins(0, 0, 0, 0)
+            self.playlist_items_layout.setSpacing(8)
+
+            self.playlists_layout.addWidget(self.loading_label, 0, Qt.AlignHCenter)
+            self.playlists_layout.addLayout(self.playlist_items_layout)
+
+            # Bind item
+            self.left_layout = QVBoxLayout()
+            self.left_layout.setContentsMargins(0, 0, 0, 0)
+            self.left_layout.setSpacing(10)
+            self.left_layout.addWidget(self.playlists_scroll, 1)
+
+            self.right_layout.addWidget(self.profile_label)
+            self.right_layout.addWidget(self.switch_profile_btn)
+            self.right_layout.addWidget(self.refresh_playlists_btn)
+            self.right_layout.addStretch(1)
+            self.right_layout.addWidget(self.version_label, 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter)
+
+            self.main_layout.addLayout(self.left_layout, 1)
+            self.main_layout.addWidget(self.right_panel)
+
+            self.setStyleSheet("""
+                QMainWindow {
+                    background-color: #202020;
+                }
+
+                QScrollArea, QFrame {
+                    background-color: #242424;
+                }
+
+                QLabel {
+                    background-color: transparent;
+                }
+
+                #rightPanel {
+                    background-color: #2b2b2b;
+                    border: 1px solid #3c3c3c;
+                    border-radius: 8px;
+                }
+
+                #profileLabel {
+                    color: #f0f0f0;
+                    font-weight: 600;
+                    padding-bottom: 6px;
+                }
+
+                #loadingLabel {
+                    color: #a8a8a8;
+                    padding: 4px;
+                }
+
+                QPushButton {
+                    background-color: #3a3a3a;
+                    color: #f0f0f0;
+                    border: 1px solid #505050;
+                    border-radius: 6px;
+                    padding: 7px 10px;
+                }
+
+                QPushButton:hover {
+                    background-color: #464646;
+                }
+
+                QPushButton:pressed {
+                    background-color: #303030;
+                }
+            """)
+
+            # Bind signals function
+            self.signals = self.PlaylistWorkerSignals()
+            self.signals.playlists_ready.connect(self.build_ui)
+            self.signals.error.connect(self.show_error)
+            self.signals.playlist_fetch_error.connect(self.show_playlist_fetch_error)
+
+            self.switch_profile_btn.clicked.connect(self.open_switch_profile_dialog)
+            self.refresh_playlists_btn.clicked.connect(self.parent.reload_playlists)
+
+        class PlaylistWorkerSignals(QObject):
+            # Signals
+            playlists_ready = Signal(dict)
+            profile_delete = Signal(str)
+
+            # playlist
+            playlist_clicked = Signal(dict)
+            video_clicked = Signal(str)
+
+            # error
+            error = Signal(str)
+            playlist_fetch_error = Signal(object)
+
+        def build_ui(self, playlists: dict[str, list]):
+            self.clear_layout(self.playlist_items_layout)
+
+            playlists = playlists.get("entries", [])
+
+            playlists = [playlist for playlist in playlists if playlist is not None]  # ignore None item
+
+            for playlist in playlists:
+                plist_id = playlist.get("id", None)
+                title = playlist.get("title", "Title not found")
+
+                item = self.PlaylistItem(
+                    self.playlists_frame,
+                    playlist,
+                    title=title,
+                )
+
+                if len(playlist.get("thumbnails", [])) > 0:
+                    thumbnail_url = playlist.get("thumbnails", [])[0].get('url', None)
+                    thumbnail_resolution = playlist.get("thumbnails", [])[0].get('resolution', None)
+
+                    thumbnail_path = Path(work_dir, "temp", "thumbnails",
+                                          f"thumbnail_{plist_id}_{thumbnail_resolution}.jpg")
+
+                    result = download_file(thumbnail_url, thumbnail_path)
+
+                    if result or (thumbnail_path.exists() and thumbnail_path.is_file()):
+                        item.set_thumbnail(thumbnail_path)
+
+                item.clicked.connect(self.open_playlist_window)
+                self.playlist_items_layout.addWidget(item)
+
+            self.loading_label.setText("Done")
+
+        @staticmethod
+        def clear_layout(layout):
+            while layout.count():
+                item = layout.takeAt(0)
+                child_layout = item.layout()
+                widget = item.widget()
+                if child_layout:
+                    PlaylistSaver.MainWindow.clear_layout(child_layout)
+                if widget:
+                    widget.deleteLater()
+
+        def open_playlist_window(self, playlist: dict):
+            window = self.PlaylistWindow(self, playlist)
+            self.child_windows.append(window)
+            window.destroyed.connect(
+                lambda _obj=None, w=window: self.child_windows.remove(w) if w in self.child_windows else None)
+            window.show()
+
+        def show_error(self, message: str):
+            QMessageBox.critical(self, "Error", message)
+
+        def show_playlist_fetch_error(self, error: PlaylistFetchException):
+            error.create_messagebox(self)
+
+        def open_video_player(self, video: dict):
+            video_url = resolve_video_page_url(video)
+            if not video_url:
+                QMessageBox.critical(self, "Error", "Unable to resolve video URL.")
+                return
+
+            dialog = self.PlayerDialog(self, video)
+            self.child_windows.append(dialog)
+            dialog.destroyed.connect(
+                lambda _obj=None, w=dialog: self.child_windows.remove(w) if w in self.child_windows else None)
+            dialog.show()
+
+        def open_switch_profile_dialog(self):
+            dialog = self.SwitchProfileDialog(self)
+            dialog.profile_changed.connect(self.apply_profile_switch)
+            dialog.exec()
+
+        def apply_profile_switch(self, profile_name: str):
+            self.parent.set_active_profile(profile_name)
+            self.profile_label.setText(f"Current Profile: {profile_name}")
+
+        class PlaylistItem(QFrame):
+            clicked = Signal(dict)
+
+            def __init__(self, parent, data, title: str = "", thumbnail_path: str | Path | None = None):
+                super().__init__(parent)
+                self.setObjectName("playlistItem")
+                self.original_thumbnail = None
+
+                self.layout = QHBoxLayout(self)
+                self.layout.setContentsMargins(12, 10, 12, 10)
+                self.layout.setSpacing(12)
+
+                self.setMinimumHeight(92)
+                self.setMaximumHeight(120)
+                self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+                # item
+                self.title_label = QLabel(title, self)
+                self.title_label.setObjectName("playlistTitle")
+                self.title_label.setWordWrap(True)
+                self.title_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+                self.title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+                self.thumbnail_label = QLabel(self)
+                self.thumbnail_label.setObjectName("thumbnailLabel")
+                self.thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.thumbnail_label.setFixedSize(PlaylistSaver.THUMBNAIL_SIZE)
+                self.thumbnail_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+                # bind
+                self.layout.addWidget(self.title_label, 1)
+                self.layout.addWidget(self.thumbnail_label)
+
+                if thumbnail_path:
+                    self.set_thumbnail(thumbnail_path)
+
+                self.setStyleSheet("""
+                    QFrame#playlistItem {
+                        background-color: #2b2b2b;
+                        border: 1px solid #3c3c3c;
+                        border-radius: 8px;
+                    }
+
+                    QFrame#playlistItem:hover {
+                        background-color: #4f0202;
+                        border-color: #555555;
+                    }
+
+                    QLabel {
+                        background-color: transparent;
+                        border: none;
+                        color: #f0f0f0;
+                    }
+
+                    #playlistTitle {
+                        font-weight: 600;
+                    }
+
+                    #thumbnailLabel {
+                        background-color: #1f1f1f;
+                        border: 1px solid #3a3a3a;
+                        border-radius: 6px;
+                    }
+                """)
+
+                # Playlist data
+                self.data = data
+
+            @property
+            def app(self):
+                return self.parent()
+
+            def set_thumbnail(self, thumbnail_path: str | Path):
+                pixmap = QPixmap(str(thumbnail_path))
+                if pixmap.isNull():
+                    self.thumbnail_label.hide()
+                    return
+
+                self.original_thumbnail = pixmap
+                self.thumbnail_label.show()
+                self.update_thumbnail_size()
+
+            def update_thumbnail_size(self):
+                if not self.original_thumbnail:
+                    return
+
+                scaled = self.original_thumbnail.scaled(
+                    self.thumbnail_label.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                self.thumbnail_label.setPixmap(scaled)
+
+            def resizeEvent(self, event):
+                super().resizeEvent(event)
+                self.update_thumbnail_size()
+
+            def mousePressEvent(self, event):
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self.clicked.emit(self.data)
+                super().mousePressEvent(event)
+
+        class VideoItem(QFrame):
+            clicked = Signal(dict)
+
+            def __init__(self, parent, video: dict, index: int = 0, thumbnail_path: str | Path | None = None):
+                super().__init__(parent)
+                self.setObjectName("videoItem")
+                self.original_thumbnail = None
+                self.video = video
+                self.id = video.get("id")
+                self.url = resolve_video_page_url(video)
+
+                title = video.get("title", "Unnamed Video")
+                if index:
+                    title = f"{index}. {title}"
+
+                if video.get("duration"):
+                    duration = str(datetime.timedelta(seconds=video.get("duration")))
+                else:
+                    duration = "Fetching duration..."
+
+                self.layout = QHBoxLayout(self)
+                self.layout.setContentsMargins(12, 10, 12, 10)
+                self.layout.setSpacing(12)
+
+                self.setMinimumHeight(92)
+                self.setMaximumHeight(120)
+                self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+                # item
+                self.title_label = QLabel(title, self)
+                self.title_label.setObjectName("videoTitle")
+                self.title_label.setWordWrap(True)
+                self.title_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+                self.title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+                self.duration_label = QLabel(duration, self)
+                self.duration_label.setObjectName("durationLabel")
+                self.duration_label.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
+
+                self.download_button = QPushButton("Download", self)
+                self.download_button.setObjectName("downloadButton")
+
+                self.thumbnail_label = QLabel(self)
+                self.thumbnail_label.setObjectName("thumbnailLabel")
+                self.thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.thumbnail_label.setFixedSize(PlaylistSaver.THUMBNAIL_SIZE)
+                self.thumbnail_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+                self.thumbnail_label.hide()
+
+                # bind
+                self.text_layout = QVBoxLayout()
+                self.text_layout.setContentsMargins(0, 0, 0, 0)
+                self.text_layout.setSpacing(6)
+                self.text_layout.addWidget(self.title_label, 1)
+                self.text_layout.addWidget(self.duration_label)
+                self.text_layout.addWidget(self.download_button, 1,
+                                           Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
+
+                self.layout.addLayout(self.text_layout, 1)
+                self.layout.addWidget(self.thumbnail_label)
+
+                if thumbnail_path:
+                    self.set_thumbnail(thumbnail_path)
+
+                self.setStyleSheet("""
+                    QFrame#videoItem {
+                        background-color: #2b2b2b;
+                        border: 1px solid #3c3c3c;
+                        border-radius: 8px;
+                    }
+
+                    QFrame#videoItem:hover {
+                        background-color: #333333;
+                        border-color: #555555;
+                    }
+
+                    QLabel {
+                        background-color: transparent;
+                        border: none;
+                        color: #f0f0f0;
+                    }
+
+                    #videoTitle {
+                        font-weight: 600;
+                    }
+
+                    #thumbnailLabel {
+                        background-color: #1f1f1f;
+                        border: 1px solid #3a3a3a;
+                        border-radius: 6px;
+                    }
+                    
+                    #downloadButton {
+                        max-height: 30px;
+                    }
+                """)
+
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+            def set_thumbnail(self, thumbnail_path: str | Path):
+                pixmap = QPixmap(str(thumbnail_path))
+                if pixmap.isNull():
+                    self.thumbnail_label.hide()
+                    return
+
+                self.original_thumbnail = pixmap
+                self.thumbnail_label.show()
+                self.update_thumbnail_size()
+
+            def update_thumbnail_size(self):
+                if not self.original_thumbnail:
+                    return
+
+                scaled = self.original_thumbnail.scaled(
+                    self.thumbnail_label.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                self.thumbnail_label.setPixmap(scaled)
+
+            def resizeEvent(self, event):
+                super().resizeEvent(event)
+                self.update_thumbnail_size()
+
+            def mousePressEvent(self, event):
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self.clicked.emit(self.video)
+                super().mousePressEvent(event)
+
+            def set_duration(self, duration: str):
+                self.duration_label.setText(duration)
+
+        class PlaylistWindow(QDialog):
+            class LoadSignals(QObject):
+                playlist_ready = Signal(dict)
+                error = Signal(str)
+
+            def __init__(self, parent, playlist: dict):
+                QDialog.__init__(self, parent)
+                self.parent = parent
+                self.playlist = playlist
+                self.setWindowTitle(playlist.get("title", "Playlist"))
+                self.resize(760, 640)
+                self.signals = self.LoadSignals()
+                self.signals.playlist_ready.connect(self.render_videos)
+                self.signals.error.connect(self.show_error)
+
+                # Layout
+                self.layout = QVBoxLayout(self)
+                self.layout.setContentsMargins(16, 16, 16, 16)
+                self.layout.setSpacing(12)
+
+                self.header_label = QLabel(playlist.get("title", "Playlist"), self)
+                self.header_label.setObjectName("playlistTitle")
+                self.header_label.setWordWrap(True)
+
+                self.info_label = QLabel("Loading playlist videos...", self)
+                self.info_label.setObjectName("playlistInfo")
+
+                self.content_layout = QHBoxLayout()
+                self.content_layout.setSpacing(12)
+
+                # Scroll area and frame for video items
+                self.scroll_area = QScrollArea(self)
+                self.scroll_area.setWidgetResizable(True)
+                self.scroll_area.setFrameShape(QFrame.NoFrame)
+
+                self.list_frame = QFrame(self.scroll_area)
+                self.list_frame.setObjectName("playlistFrame")
+                self.list_layout = QVBoxLayout(self.list_frame)
+                self.list_layout.setContentsMargins(8, 8, 8, 8)
+                self.list_layout.setSpacing(8)
+                self.scroll_area.setWidget(self.list_frame)
+
+                self.control_panel = QFrame(self)
+                self.control_panel.setObjectName("playlistControls")
+                self.control_panel.setFixedWidth(150)
+                self.control_layout = QVBoxLayout(self.control_panel)
+                self.control_layout.setContentsMargins(12, 12, 12, 12)
+                self.control_layout.setSpacing(10)
+
+                self.reload_playlist_btn = QPushButton("Reload")
+                self.reload_playlist_btn.setMinimumHeight(34)
+                self.reload_playlist_btn.clicked.connect(self.render_playlist)
+
+                self.control_layout.addWidget(self.reload_playlist_btn)
+                self.control_layout.addStretch(1)
+
+                self.content_layout.addWidget(self.scroll_area, 1)
+                self.content_layout.addWidget(self.control_panel)
+
+                self.layout.addWidget(self.header_label)
+                self.layout.addWidget(self.info_label)
+                self.layout.addLayout(self.content_layout, 1)
+
+                self.render_playlist()
+
+                self.setStyleSheet("""
+                    QDialog {
+                        background-color: #202020;
+                    }
+
+                    QScrollArea, #playlistFrame {
+                        background-color: #242424;
+                    }
+
+                    #playlistTitle {
+                        color: #f0f0f0;
+                        font-size: 20px;
+                        font-weight: 700;
+                    }
+
+                    #playlistInfo {
+                        color: #a8a8a8;
+                    }
+
+                    #playlistControls {
+                        background-color: #2b2b2b;
+                        border: 1px solid #3c3c3c;
+                        border-radius: 8px;
+                    }
+
+                    QLabel {
+                        background-color: transparent;
+                        color: #f0f0f0;
+                    }
+
+                    QPushButton {
+                        background-color: #3a3a3a;
+                        color: #f0f0f0;
+                        border: 1px solid #505050;
+                        border-radius: 6px;
+                        padding: 7px 10px;
+                    }
+
+                    QPushButton:hover {
+                        background-color: #464646;
+                    }
+
+                    QPushButton:disabled {
+                        color: #999999;
+                        background-color: #303030;
+                    }
+                """)
+
+            @property
+            def app(self):
+                return self.parent.parent
+
+            def render_playlist(self):
+                self.reload_playlist_btn.setEnabled(False)
+                self.info_label.setText("Loading playlist videos...")
+                PlaylistSaver.MainWindow.clear_layout(self.list_layout)
+
+                threading.Thread(target=self.load_playlist_worker, daemon=True).start()
+
+            def load_playlist_worker(self):
+                try:
+                    playlist_data = self.app.fetch_playlist_videos(self.playlist)
+                except Exception as e:
+                    logger.error("Unable to load playlist videos: %s", e)
+                    self.signals.error.emit(str(e))
+                    return
+
+                if playlist_data is None:
+                    playlist_data = {"entries": []}
+
+                self.signals.playlist_ready.emit(playlist_data)
+
+            def render_videos(self, playlist_data: dict):
+                PlaylistSaver.MainWindow.clear_layout(self.list_layout)
+                self.reload_playlist_btn.setEnabled(True)
+
+                entries = [entry for entry in playlist_data.get("entries", []) if entry is not None]
+                self.info_label.setText(f"{len(entries)} videos")
+
+                if not entries:
+                    self.list_layout.addWidget(QLabel("No videos found.", self.list_frame))
+                    self.list_layout.addStretch(1)
+                    return
+
+                for index, video in enumerate(entries, start=1):
+                    thumbnail_path = self.get_video_thumbnail_path(video)
+                    item = PlaylistSaver.MainWindow.VideoItem(self.list_frame, video, index, thumbnail_path)
+                    item.clicked.connect(self.parent.open_video_player)
+                    self.list_layout.addWidget(item)
+
+                self.list_layout.addStretch(1)
+
+            def show_error(self, message: str):
+                self.reload_playlist_btn.setEnabled(True)
+                self.info_label.setText("Unable to load playlist.")
+                QMessageBox.critical(self, "Error", f"Unable to load playlist: {message}")
+
+            def get_video_thumbnail_path(self, video: dict):
+                thumbnails = video.get("thumbnails") or []
+                if not thumbnails:
+                    return None
+
+                thumbnail = thumbnails[0]
+                thumbnail_url = thumbnail.get("url")
+                if not thumbnail_url:
+                    return None
+
+                thumbnail_resolution = thumbnail.get("resolution", "unknown")
+                video_id = video.get("id") or "unknown"
+                thumbnail_path = Path(work_dir, "temp", "thumbnails",
+                                      f"thumbnail_{video_id}_{thumbnail_resolution}.jpg")
+
+                if thumbnail_path.exists():
+                    return thumbnail_path
+
+                if download_file(thumbnail_url, thumbnail_path):
+                    return thumbnail_path
+
+                return None
+
+        class PlayerDialog(QDialog):
+            status_changed = Signal(str)
+
+            def __init__(self, parent, video: dict):
+                QDialog.__init__(self, parent)
+                self.parent = parent
+                self.video = video
+                self.video_url = resolve_video_page_url(video)
+                self.process = None
+                self.setWindowTitle(video.get("title", "Video"))
+                self.resize(440, 190)
+
+                self.status_changed.connect(self.set_status)
+
+                self.layout = QVBoxLayout(self)
+                self.layout.setContentsMargins(16, 16, 16, 16)
+                self.layout.setSpacing(10)
+
+                self.title_label = QLabel(video.get("title", "Video"), self)
+                self.title_label.setWordWrap(True)
+
+                self.status_label = QLabel("Launching mpv...", self)
+                self.url_label = QLabel(self.video_url or "", self)
+                self.url_label.setWordWrap(True)
+
+                self.close_btn = QPushButton("Close Player", self)
+                self.close_btn.clicked.connect(self.close)
+
+                self.layout.addWidget(self.title_label)
+                self.layout.addWidget(self.status_label)
+                self.layout.addWidget(self.url_label)
+                self.layout.addWidget(self.close_btn)
+
+                self.setStyleSheet("""
+                    QDialog {
+                        background-color: #202020;
+                    }
+
+                    QLabel {
+                        background-color: transparent;
+                        color: #f0f0f0;
+                    }
+
+                    QPushButton {
+                        background-color: #3a3a3a;
+                        color: #f0f0f0;
+                        border: 1px solid #505050;
+                        border-radius: 6px;
+                        padding: 7px 10px;
+                    }
+
+                    QPushButton:hover {
+                        background-color: #464646;
+                    }
+                """)
+
+                threading.Thread(target=self.run_mpv, daemon=True).start()
+
+            def set_status(self, message: str):
+                self.status_label.setText(message)
+
+            def run_mpv(self):
+                mpv_path = find_mpv_path(PROGRAM_DIR)
+                if not mpv_path:
+                    self.status_changed.emit("mpv not found in bin/ or PATH.")
+                    return
+
+                try:
+                    self.process = subprocess.Popen(
+                        [
+                            mpv_path,
+                            # "--force-window=immediate",
+                            "--focus-on=open",
+                            self.video_url,
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                except Exception as e:
+                    logger.error("Unable to start mpv: %s", e)
+                    self.status_changed.emit(f"Unable to start mpv: {e}")
+                    return
+
+                self.parent.parent.mpv_processes[self] = self.process
+                self.status_changed.emit("Playing in mpv...")
+                self.process.wait()
+                self.parent.parent.mpv_processes.pop(self, None)
+                self.status_changed.emit("Playback finished.")
+
+            def closeEvent(self, event):
+                process = self.parent.parent.mpv_processes.pop(self, None)
+                if process and process.poll() is None:
+                    process.terminate()
+                event.accept()
+
+        class SwitchProfileDialog(QDialog):
+            profile_changed = Signal(str)
+
+            def __init__(self, parent):
+                QDialog.__init__(self, parent)
+                self.parent = parent
+                self.setWindowTitle("Switch Profile")
+                self.resize(420, 420)
+
+                # Layout
+                self.layout = QVBoxLayout(self)
+                self.layout.setContentsMargins(16, 16, 16, 16)
+                self.layout.setSpacing(12)
+
+                # Items
+                self.current_profile_label = QLabel(f"Current: {self.app.get_active_profile_name()}")
+                self.current_profile_label.setWordWrap(True)
+                self.current_profile_label.setObjectName("currentProfile")
+
+                # Scroll are and frame (for profile item)
+                self.scroll_area = QScrollArea(self)
+                self.scroll_area.setWidgetResizable(True)
+                self.scroll_area.setFrameShape(QFrame.NoFrame)
+
+                self.list_frame = QFrame(self.scroll_area)
+                self.list_frame.setObjectName("profileList")
+                self.list_layout = QVBoxLayout(self.list_frame)
+                self.list_layout.setContentsMargins(8, 8, 8, 8)
+                self.list_layout.setSpacing(8)
+                self.scroll_area.setWidget(self.list_frame)
+
+                self.create_profile_btn = QPushButton("Create Profile")
+                self.create_profile_btn.setMinimumHeight(34)
+                self.create_profile_btn.clicked.connect(self.create_profile)
+
+                self.layout.addWidget(self.current_profile_label)
+                self.layout.addWidget(self.scroll_area, 1)
+                self.layout.addWidget(self.create_profile_btn)
+
+                self.render_profiles()
+
+                self.setStyleSheet("""
+                    QDialog {
+                        background-color: #202020;
+                    }
+
+                    QScrollArea, #profileList {
+                        background-color: #242424;
+                    }
+
+                    #currentProfile {
+                        background-color: transparent;
+                        color: #f0f0f0;
+                        font-weight: 600;
+                        padding-bottom: 4px;
+                    }
+
+                    QFrame#profileRow {
+                        background-color: #2b2b2b;
+                        border: 1px solid #3c3c3c;
+                        border-radius: 8px;
+                    }
+
+                    QLabel {
+                        background-color: transparent;
+                        color: #f0f0f0;
+                    }
+
+                    QPushButton {
+                        background-color: #3a3a3a;
+                        color: #f0f0f0;
+                        border: 1px solid #505050;
+                        border-radius: 6px;
+                        padding: 7px 10px;
+                    }
+
+                    QPushButton:hover {
+                        background-color: #464646;
+                    }
+
+                    QPushButton:disabled {
+                        color: #999999;
+                        background-color: #303030;
+                    }
+                """)
+
+            @property
+            def app(self):
+                return self.parent.parent
+
+            def clear_profiles(self):
+                while self.list_layout.count():
+                    item = self.list_layout.takeAt(0)
+                    widget = item.widget()
+                    if widget:
+                        widget.deleteLater()
+
+            class ProfileRow(QFrame):
+                def __init__(self, parent, profile_name: str, active_profile: str,
+                             switch_profile, delete_profile):
+                    QFrame.__init__(self, parent)
+                    self.setObjectName("profileRow")
+
+                    self.row_layout = QHBoxLayout(self)
+                    self.row_layout.setContentsMargins(10, 8, 10, 8)
+                    self.row_layout.setSpacing(8)
+
+                    self.name_label = QLabel(profile_name)
+                    self.name_label.setWordWrap(True)
+
+                    self.switch_btn = QPushButton("Current" if profile_name == active_profile else "Switch")
+                    self.switch_btn.setMinimumWidth(88)
+                    self.switch_btn.setEnabled(profile_name != active_profile)
+                    self.switch_btn.clicked.connect(lambda _checked=False, name=profile_name: switch_profile(name))
+
+                    self.delete_btn = QPushButton("Delete")
+                    self.delete_btn.setMinimumWidth(88)
+                    self.delete_btn.setDisabled(profile_name == "Default")
+                    self.delete_btn.clicked.connect(lambda _checked=False, name=profile_name: delete_profile(name))
+
+                    self.row_layout.addWidget(self.name_label, 1)
+                    self.row_layout.addWidget(self.switch_btn)
+                    self.row_layout.addWidget(self.delete_btn)
+
+            def render_profiles(self):
+                self.clear_profiles()
+
+                meta = self.app.load_profiles_meta()
+                active_profile = meta["active_profile"]
+
+                for profile_name in meta["profiles"]:
+                    row = self.ProfileRow(self, profile_name, active_profile, self.switch_profile, self.delete_profile)
+                    self.list_layout.addWidget(row)
+
+                self.list_layout.addStretch(1)
+
+            def switch_profile(self, profile_name: str):
+                self.profile_changed.emit(profile_name)
+                self.accept()
+
+            def delete_profile(self, profile_name: str):
+                meta = self.app.load_profiles_meta()
+
+                if profile_name == meta["active_profile"]:
+                    QMessageBox.critical(self, "Error", "Cannot delete the active profile.")
+                    return
+
+                if profile_name == self.app.DEFAULT_PROFILE_NAME:
+                    QMessageBox.critical(self, "Error", "Cannot delete the default profile.")
+                    return
+
+                reply = QMessageBox.question(
+                    self,
+                    "Delete Profile",
+                    f"Delete profile '{profile_name}'?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+
+                if reply != QMessageBox.Yes:
+                    return
+
+                meta["profiles"] = [
+                    name for name in meta["profiles"]
+                    if name != profile_name
+                ]
+
+                self.app.save_profiles_meta(meta)
+                self.render_profiles()
+
+            def create_profile(self):
+                profile_name, ok = QInputDialog.getText(self, "Create Profile", "Profile name:")
+
+                if not ok:
+                    return
+
+                profile_name = profile_name.strip()
+                if not profile_name:
+                    QMessageBox.critical(self, "Error", "Profile name cannot be empty.")
+                    return
+
+                self.app.ensure_profile_exists(profile_name)
+                self.render_profiles()
+
+    def init(self):
+        self.initialize_profiles()
+        # Start background thread after root is ready for UI callbacks.
+        self.reload_playlists()
+
+    def reload_playlists(self):
+        self.window.loading_label.setText("Loading playlists...")
+
+        threading.Thread(
+            target=fetch_playlists_data,
+            args=(self.url_schema, self.get_profile_cookie_path(self.active_profile_name), self.get_ydl_opts(), self.on_data_ready),
+            daemon=True,
+        ).start()
+
+    #
+    # Profile
+    #
+    def initialize_profiles(self):
+        try:
+            self.profiles_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.error("Unable to create profiles folder:", e)
+            QMessageBox.critical(self.window, "Error",
+                                 "Unable to create profiles folder.\n"
+                                 f"At path: {self.profiles_path.as_posix()}\n"
+                                 f"Reason: {e}\n"
+                                 f"Solution: Try to remove profiles folder manually and try again.")
+
+        active_name = self.get_active_profile_name()
+        self.ensure_profile_exists(active_name)
+        self.set_active_profile(active_name)
+
+    def ensure_profile_exists(self, profile_name: str):
+        meta = self.load_profiles_meta()
+        profiles = meta["profiles"]
+
+        if profile_name not in profiles:
+            profiles.append(profile_name)
+            meta["profiles"] = profiles
+            self.save_profiles_meta(meta)
+
+        self.get_profile_dir(profile_name).parent.mkdir(parents=True, exist_ok=True)
+
+    def get_active_profile_name(self):
+        meta = self.load_profiles_meta()
+        self.active_profile_name = meta.get("active_profile", None)
+        return self.active_profile_name
+
+    def load_profiles_meta(self):
+        meta = read_json(self.profiles_meta_path)
+        if not meta:
+            return {
+                "active_profile": self.DEFAULT_PROFILE_NAME,
+                "profiles": [self.DEFAULT_PROFILE_NAME],
+            }
+
+        profiles = meta.get("profiles") or [self.DEFAULT_PROFILE_NAME]
+        active_profile = meta.get("active_profile") or profiles[0]
+
+        if active_profile not in profiles:
+            profiles.insert(0, active_profile)
+
+        return {
+            "active_profile": active_profile,
+            "profiles": profiles,
+        }
+
+    def set_active_profile(self, profile_name: str):
+        meta = self.load_profiles_meta()
+        profiles = meta["profiles"]
+
+        if profile_name not in profiles:
+            profiles.append(profile_name)
+
+        meta["profiles"] = profiles
+        meta["active_profile"] = profile_name
+        self.save_profiles_meta(meta)
+
+        self.active_profile_name = profile_name
+        self.cookie_path = self.get_profile_cookie_path(profile_name)
+        self.cookie_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def save_profiles_meta(self, meta: dict):
+        save_json(meta, self.profiles_meta_path)
+
+    def delete_profile(self, profile_name: str):
+        meta = self.load_profiles_meta()
+
+        if not profile_name in meta["profiles"]:
+            return
+
+        meta["profiles"].remove(profile_name)
+
+        self.save_profiles_meta(meta)
+
+    #
+    # Path
+    #
+    def get_profile_cookie_path(self, profile_name: str):
+        return Path(self.get_profile_dir(profile_name), "cookies.txt")
+
+    def get_profile_dir(self, profile_name: str):
+        return Path(self.profiles_path, sanitize_filename(profile_name))
+
+    def get_profile_temp_dir(self, profile_name: str | None = None):
+        profile_name = profile_name or self.active_profile_name
+        return self.temp_path / sanitize_filename(profile_name)
+
+    def get_playlist_cache_path(self, playlist_id: str):
+        safe_id = sanitize_filename(playlist_id or "unknown")
+        return self.get_profile_temp_dir() / "playlists" / f"{safe_id}.json"
+
+    #
+    # PlaylistData
+    #
+    def on_data_ready(self, data, error):
+        if isinstance(error, PlaylistFetchException):
+            self.window.signals.playlist_fetch_error.emit(error)
+        if data is None:
+            data = {"entries": []}
+
+        self.playlists["entries"] = data.get("entries", [])
+        self.window.signals.playlists_ready.emit(self.playlists)
+
+    def load_playlist_videos(self, playlist_id: str):
+        cache_path = self.get_playlist_cache_path(playlist_id)
+        if os.path.exists(cache_path):
+            return read_json(cache_path)
+        return None
+
+    def fetch_playlist_videos(self, playlist: dict):
+        playlist_id = playlist.get("id")
+        playlist_url = playlist.get("url") or playlist.get("webpage_url")
+
+        if not playlist_url and playlist_id and not str(playlist_id).startswith("VL"):
+            playlist_url = f"https://www.youtube.com/playlist?list={playlist_id}"
+
+        if not playlist_url:
+            raise ValueError("Playlist URL not found.")
+
+        cached_data = self.load_playlist_videos(playlist_id)
+        if cached_data:
+            return cached_data
+
+        opts = self.get_ydl_opts()
+
+        opts.update({"extract_flat": True,
+                     "skip_download": True,
+                     "quiet": True, })
+
         with fetch_playlist_lock:
-            opts = get_ydl_opts()
-            opts.update({
-                'extract_flat': True,
-                'skip_download': True,
-                'quiet': True,
-            })
+            with YoutubeDL(opts) as ydl:
+                data = ydl.extract_info(playlist_url, download=False)
 
-            try:
-                with YoutubeDL(opts) as ydl:
-                    data = ydl.extract_info("https://www.youtube.com/feed/playlists", download=False)
+        self.save_playlist_videos(playlist_id, data)
+        return data
 
-            except Exception as e:
-                logger.error("An error occurred:", e)
-                messagebox.showerror("Error", f"Unable to fetch playlists: {e}")
-                sys.exit(-1)
+    def save_playlist_videos(self, playlist_id: str, data: dict):
+        save_json(data, self.get_playlist_cache_path(playlist_id))
 
-    save_json(data, get_profile_playlists_cache_path())
+    def get_ydl_opts(self):
+        return {
+            'cookiefile': self.get_profile_cookie_path(self.active_profile_name),
+            'verbose': True,
+            'download': False,
+            'js_runtimes': {"node": {}},
+            'extract_flat': False,
+            'lazy_playlist': False,
+            "ignoreerrors": False
+        }
 
-    callback(data)
 
 @click.command()
 @click.argument("url_schema", default=None, required=False)
 @click.option("--cookie-file", "-cf", required=False, default=None, help="Cookies file",
               type=click.Path(exists=True))
-def main(url_schema, cookie_file: str):
-    initialize_profiles()
-    current_playlists_data = {"entries": []}
+@click.option("--new-work-dir", "-wd", required=False, default=None, help="New working directory",
+              type=click.Path(exists=True))
+def main(url_schema, cookie_file: str, new_work_dir: str):
+    global work_dir
 
-    def on_data_ready(data):
-        current_playlists_data["entries"] = data.get("entries", [])
-        root.after(0, lambda func=build_ui: func(data))
+    icon_path = PROGRAM_DIR / "assets" / "icon.ico"
 
-    # CTk
-    root = ctk.CTk()
-    root.geometry("600x800")
-    root.title("PlaylistSaver {}".format(VERSION))
+    if new_work_dir:
+        work_dir = Path(new_work_dir)
 
-    # Layout
-    playlist_frame = ctk.CTkScrollableFrame(root)
-    playlist_frame.pack(fill="both", expand=True)
+    if work_dir is None:
+        app = QApplication(sys.argv)
 
-    operate_frame = ctk.CTkFrame(root)
-    operate_frame.pack(fill="x", anchor="s")
+        if icon_path.exists():
+            app.setWindowIcon(QIcon(icon_path.as_posix()))
 
-    profile_label = ctk.CTkLabel(operate_frame, text=f"Current Profile: {get_active_profile_name()}")
-    profile_label.pack(fill="x", padx=10, pady=(10, 5))
-
-    switch_profile_btn = ctk.CTkButton(operate_frame, text="Switch Profile")
-    switch_profile_btn.pack(fill="x", padx=10, pady=(0, 10))
-
-    download_status_label = ctk.CTkLabel(operate_frame, text="Playlist batch download idle.")
-    download_status_label.pack(fill="x", padx=10, pady=(0, 5))
-
-    batch_download_btn = ctk.CTkButton(operate_frame, text="Batch Download Playlists")
-    batch_download_btn.pack(fill="x", padx=10, pady=(0, 10))
-
-    loading_label = ctk.CTkLabel(playlist_frame, text="Loading playlists...")
-    loading_label.pack(pady=20)
-
-    # Bind specified callback func
-    def bind_click_recursive(widget, callback):
-        widget.bind("<Button-1>", callback)
-        for child in widget.winfo_children():
-            bind_click_recursive(child, callback)
-
-    def refresh_profile_label():
-        profile_label.configure(text=f"Current Profile: {get_active_profile_name()}")
-
-    def update_download_status(message: str):
-        root.after(0, lambda label=download_status_label: label.configure(text=message))
-
-    def reload_playlists(current_url_schema=None, current_cookie_file=None):
-        for widget in playlist_frame.winfo_children():
-            widget.destroy()
-
-        ctk.CTkLabel(
-            playlist_frame,
-            text=f"Loading playlists for {get_active_profile_name()}...",
-        ).pack(pady=20)
-
-        threading.Thread(
-            target=background,
-            args=(current_url_schema, current_cookie_file, on_data_ready),
-            daemon=True,
-        ).start()
-
-    def switch_to_profile(profile_name: str, window: ctk.CTkToplevel | None = None):
-        set_active_profile(profile_name)
-        refresh_profile_label()
-        if window and window.winfo_exists():
-            window.destroy()
-        reload_playlists()
-
-    def open_switch_profile_window():
-        profile_window = ctk.CTkToplevel(root)
-        profile_window.title("Switch Profile")
-        profile_window.geometry("420x420")
-
-        ctk.CTkLabel(
-            profile_window,
-            text=f"Active: {get_active_profile_name()}",
-        ).pack(anchor="w", padx=15, pady=(15, 10))
-
-        list_frame = ctk.CTkScrollableFrame(profile_window)
-        list_frame.pack(fill="both", expand=True, padx=15, pady=(0, 10))
-
-        def render_profiles():
-            for widget in list_frame.winfo_children():
-                widget.destroy()
-
-            meta = load_profiles_meta()
-            active_name = meta["active_profile"]
-
-            for profile_name in meta["profiles"]:
-                profile_item = ctk.CTkFrame(list_frame, border_width=1, border_color="#666666")
-                profile_item.pack(fill="x", padx=5, pady=5)
-
-                ctk.CTkLabel(
-                    profile_item,
-                    text=profile_name,
-                ).pack(side="left", padx=10, pady=10)
-
-                button_text = "Current" if profile_name == active_name else "Switch"
-                button_state = "disabled" if profile_name == active_name else "normal"
-
-                ctk.CTkButton(
-                    profile_item,
-                    text=button_text,
-                    width=90,
-                    state=button_state,
-                    command=lambda current_profile=profile_name: switch_to_profile(current_profile, profile_window),
-                ).pack(side="right", padx=10, pady=10)
-
-        def create_profile():
-            new_profile_name = simpledialog.askstring(
-                "Create Profile",
-                "Profile name:",
-                parent=profile_window,
-            )
-
-            if not new_profile_name:
-                return
-
-            new_profile_name = new_profile_name.strip()
-            if not new_profile_name:
-                messagebox.showerror("Error", "Profile name cannot be empty.")
-                return
-
-            ensure_profile_exists(new_profile_name)
-            render_profiles()
-
-        ctk.CTkButton(
-            profile_window,
-            text="Create Profile",
-            command=create_profile,
-        ).pack(fill="x", padx=15, pady=(0, 15))
-
-        render_profiles()
-
-    switch_profile_btn.configure(command=open_switch_profile_window)
-
-    def start_batch_download():
-        playlists = current_playlists_data.get("entries") or []
-
-        if not playlists:
-            messagebox.showerror("Error", "No playlists loaded yet.")
-            return
-
-        batch_size = simpledialog.askinteger(
-            "Batch Download",
-            "Batch size:",
-            parent=root,
-            initialvalue=5,
-            minvalue=1,
+        folder = QFileDialog.getExistingDirectory(
+            None, "Select a folder as the new working directory"
         )
 
-        if batch_size is None:
-            return
-
-        progress = load_playlist_batch_progress()
-        completed_ids = set(progress.get("completed_ids", []))
-        pending_playlists = [playlist for playlist in playlists if playlist.get("id") not in completed_ids]
-
-        if not pending_playlists:
-            if not messagebox.askyesno("Batch Download", "All playlists are already cached. Download again from scratch?"):
-                return
-
-            progress = {
-                "profile": get_active_profile_name(),
-                "completed_ids": [],
-                "failed": [],
-                "last_index": -1,
-                "updated_at": None,
-            }
-            save_playlist_batch_progress(progress)
-            pending_playlists = playlists
-
-        batch_download_btn.configure(state="disabled")
-        update_download_status(f"Starting batch download ({len(pending_playlists)} playlists pending)...")
-
-        def worker():
-            with download_playlists_lock:
-                progress_data = load_playlist_batch_progress()
-                completed = set(progress_data.get("completed_ids", []))
-                failed_entries = progress_data.get("failed", [])
-
-                for batch_start in range(0, len(playlists), batch_size):
-                    batch = playlists[batch_start:batch_start + batch_size]
-                    batch_index = (batch_start // batch_size) + 1
-                    total_batches = (len(playlists) + batch_size - 1) // batch_size
-                    update_download_status(f"Downloading batch {batch_index}/{total_batches}...")
-
-                    for index_in_batch, playlist in enumerate(batch, start=batch_start):
-                        playlist_id = playlist.get("id", "unknown")
-                        playlist_title = playlist.get("title", playlist_id)
-
-                        if playlist_id in completed:
-                            progress_data["last_index"] = index_in_batch
-                            save_playlist_batch_progress(progress_data)
-                            continue
-
-                        update_download_status(f"Saving playlist {index_in_batch + 1}/{len(playlists)}: {playlist_title}")
-
-                        try:
-                            fetch_playlist_videos(playlist)
-                            completed.add(playlist_id)
-                            progress_data["completed_ids"] = list(completed)
-                            progress_data["failed"] = [item for item in failed_entries if item.get("id") != playlist_id]
-                        except Exception as e:
-                            logger.error("Batch download failed for %s: %s", playlist_title, e)
-                            failed_entries = [item for item in failed_entries if item.get("id") != playlist_id]
-                            failed_entries.append({
-                                "id": playlist_id,
-                                "title": playlist_title,
-                                "error": str(e),
-                            })
-                            progress_data["failed"] = failed_entries
-                        finally:
-                            progress_data["last_index"] = index_in_batch
-                            save_playlist_batch_progress(progress_data)
-
-                failed_count = len(progress_data.get("failed", []))
-                finished_message = (
-                    f"Batch download finished. Success: {len(progress_data.get('completed_ids', []))}, "
-                    f"Failed: {failed_count}"
-                )
-                update_download_status(finished_message)
-                root.after(0, lambda btn=batch_download_btn: btn.configure(state="normal"))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    batch_download_btn.configure(command=start_batch_download)
-
-    # Start background thread after root is ready for UI callbacks.
-    reload_playlists(url_schema, cookie_file)
-
-    def close_video_window(video_window):
-        process = mpv_processes.pop(video_window, None)
-        if process and process.poll() is None:
-            process.terminate()
-        if video_window.winfo_exists():
-            video_window.destroy()
-
-    def open_video_player(video: dict):
-        video_url = resolve_video_page_url(video)
-        video_title = video.get("title", "Video not found")
-
-        if not video_url:
-            messagebox.showerror("Error", "Unable to resolve video URL.")
-            return
-
-        player_window = ctk.CTkToplevel(root)
-        player_window.title(video_title)
-        player_window.geometry("420x180")
-
-        ctk.CTkLabel(
-            player_window,
-            text=video_title,
-            wraplength=360,
-            justify="left",
-        ).pack(anchor="w", padx=15, pady=(15, 10))
-
-        status_label = ctk.CTkLabel(player_window, text="Launching mpv...")
-        status_label.pack(anchor="w", padx=15, pady=(0, 10))
-
-        ctk.CTkLabel(
-            player_window,
-            text=video_url,
-            wraplength=360,
-            justify="left",
-        ).pack(anchor="w", padx=15, pady=(0, 15))
-
-        close_button = ctk.CTkButton(
-            player_window,
-            text="Close Player",
-            command=lambda: close_video_window(player_window),
-        )
-        close_button.pack(fill="x", padx=15, pady=(0, 15))
-
-        player_window.protocol("WM_DELETE_WINDOW", lambda: close_video_window(player_window))
-
-        threading.Thread(
-            target=play_video_with_mpv,
-            args=(video_url, player_window, status_label),
-            daemon=True,
-        ).start()
-
-    class VideoObject(ctk.CTkFrame):
-        def __init__(self, vid_id, url, title, duration, index, master, border_width=1, border_color="#666666"):
-            super().__init__(master)
-            self.id = vid_id
-            self.url = url
-            self.title = title
-            self.duration = duration
-
-            self.title_label = ctk.CTkLabel(
-                self,
-                text=f"{index}. {self.title}",
-                wraplength=600,
-                justify="left",
-            ).pack(anchor="w", padx=10, pady=(10, 5))
-
-            self.duration_label = ctk.CTkLabel(
-                self,
-                text=duration,
-                text_color="#aaaaaa",
-            ).pack(anchor="w", padx=10, pady=(0, 10))
-
-            self.thumbnail_label = None
-
-        def apply_thumbnail(self, thumbnail):
-            self.thumbnail_label = ctk.CTkLabel(self, image=thumbnail, text="")
-            self.thumbnail_label.pack(anchor="e", padx=10, pady=(0, 10))
-            self.thumbnail_label.update()
-
-    max_item_in_one_page = 15
-
-    class PlaylistWindow(ctk.CTkToplevel):
-        def __init__(self, title, master):
-            ctk.CTkToplevel.__init__(self, master)
-            self.title = title
-            self.geometry("700x700")
-
-            self.header_label = ctk.CTkLabel(
-                self,
-                text=title,
-                font=("Arial", 20, "bold")
+        if folder:
+            work_dir = Path(folder)
+        else:
+            QMessageBox.warning(
+                None,
+                "Warning",
+                "PlaylistSaver requires a working directory to store files. Please specify a working directory"
+                " using argument \"--new-work-dir\".",
             )
-            self.header_label.pack(anchor="w", padx=15, pady=(15, 5))
+            sys.exit(1)
 
-            self.info_label = ctk.CTkLabel(
-                self,
-                text="Loading playlist videos..."
-            )
-            self.info_label.pack(anchor="w", padx=15, pady=(0, 10))
+        app.shutdown()
 
-            # Main Area
-            self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
-            self.content_frame.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+    app = PlaylistSaver(
+        url_schema,
+        cookie_file,
+    )
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(icon_path.as_posix()))
+    sys.exit(app.exec())
 
-            # Video List
-            self.video_frame = ctk.CTkScrollableFrame(self.content_frame)
-            self.video_frame.pack(
-                side="left",
-                fill="both",
-                expand=True
-            )
-
-            # Control Panel
-            self.operate_frame = ctk.CTkFrame(
-                self.content_frame,
-                width=180
-            )
-            self.operate_frame.pack(
-                side="right",
-                fill="y",
-                padx=(10, 0)
-            )
-
-            self.operate_frame.pack_propagate(False)
-
-            self.current_page_label = ctk.CTkLabel(
-                self.operate_frame,
-                text="Page Unloaded"
-            )
-            self.current_page_label.pack(pady=(15, 5))
-
-            self.current_length_label = ctk.CTkLabel(
-                self.operate_frame,
-                text="Counting..."
-            )
-            self.current_length_label.pack(pady=(0, 15))
-
-            self.go_page_btn_frame = ctk.CTkFrame(
-                self.operate_frame,
-                fg_color="transparent"
-            )
-            self.go_page_btn_frame.pack(side="bottom", pady=15)
-
-            self.previous_page_btn = ctk.CTkButton(
-                self.go_page_btn_frame,
-                text="◀",
-                width=50,
-                height=40,
-                command=self.previous_page
-            )
-            self.previous_page_btn.configure(state="disabled")
-
-            self.next_page_btn = ctk.CTkButton(
-                self.go_page_btn_frame,
-                text="▶",
-                width=50,
-                height=40,
-                command=self.next_page
-            )
-
-            self.previous_page_btn.grid(row=0, column=0, padx=5)
-            self.next_page_btn.grid(row=0, column=1, padx=5)
-
-            self.pages = []
-            self.inited = False
-            self.current_page = 0
-
-            self.video_updater = None
-
-            self.thread_pool = []
-
-            self.protocol("WM_DELETE_WINDOW", self.on_close)
-
-        def load_page(self, page):
-            if len(self.pages) < page+1 or (self.current_page == page and self.inited):
-                return
-
-            if not self.inited:
-                self.inited = True
-
-            videos: List[VideoObject] = self.pages[page]
-
-            # Remove old items
-            for item in self.video_frame.winfo_children():
-                item.pack_forget()
-
-            for video in videos:
-                video.pack(fill="x", padx=5, pady=5)
-
-            self.current_length_label.configure(text=f"Total: {len(videos)}")
-            self.current_page_label.configure(text=f"Page {self.current_page+1}")
-
-            if self.video_updater:
-                thread = threading.Thread(target=self.video_updater, args=(videos,))
-                self.thread_pool.append(thread)
-                thread.start()
-
-        def handle_page_switcher(self):
-            if self.current_page == 0:
-                self.previous_page_btn.configure(state="disabled")
-            else:
-                self.previous_page_btn.configure(state="normal")
-
-            if self.current_page == len(self.pages)-1:
-                self.next_page_btn.configure(state="disabled")
-            else:
-                self.next_page_btn.configure(state="normal")
-
-        def previous_page(self):
-            if self.current_page-1 > len(self.pages)-1 or self.current_page-1 < 0:
-                return
-
-            self.load_page(self.current_page-1)
-            self.current_page -= 1
-            self.handle_page_switcher()
-
-        def next_page(self):
-            if self.current_page+1 > len(self.pages)-1 or self.current_page+1 < 0:
-                return
-
-            self.load_page(self.current_page+1)
-            self.current_page += 1
-            self.handle_page_switcher()
-
-        def on_close(self):
-            for thread in self.thread_pool:
-                if thread.is_alive():
-                    thread.stop()
-
-            self.destroy()
-
-
-    def open_playlist_window(playlist: dict):
-        window = PlaylistWindow(
-            playlist["title"],
-            root
-        )
-
-        def render_videos(playlist_data):
-            for widget in window.video_frame.winfo_children():
-                widget.destroy()
-
-            entries = playlist_data.get("entries") or []
-            window.info_label.configure(text=f"{len(entries)} videos")
-
-            if not entries:
-                ctk.CTkLabel(window.video_frame, text="No videos found.").pack(anchor="w", padx=10, pady=10)
-                return
-
-            entries = [entry for entry in entries if entry is not None]
-
-            videos = []
-
-            for index, video in enumerate(entries, start=1):
-                video_title = video.get("title", "Video not found")
-
-                if video.get("duration"):
-                    duration = str(datetime.timedelta(seconds=video.get("duration")))
-                else:
-                    duration = "Missing duration data"
-
-                video_url = resolve_video_page_url(video)
-
-                video_obj = VideoObject(
-                    video.get("id"),
-                    video_url,
-                    video_title,
-                    duration,
-                    index,
-                    window.video_frame
-                )
-
-                videos.append(video_obj)
-
-                # Open video player (mpv) when video_frame is clicked
-                bind_click_recursive(video_obj, lambda _event, current_video=video: open_video_player(current_video))
-
-            window.pages = [videos[i:i + max_item_in_one_page] for i in range(0, len(videos), max_item_in_one_page)]
-            window.load_page(0)
-
-
-        # Update video detail to frame after playlist is loaded (make playlist load faster)
-        def video_info_updater(videos: list[VideoObject]):
-            sem = asyncio.Semaphore(5)
-
-            async def inner(video):
-                async with sem:
-                    info = await asyncio.to_thread(fetch_video_details, video.url)
-
-                    if info is None:
-                        root.after(0, lambda v=video: v.duration_label.configure(text="No data"))
-                        return
-
-                    thumbnails = info.get("thumbnails", [])
-
-                    if not thumbnails:
-                        return
-
-                    thumbnail_url = thumbnails[0].get("url")
-                    thumbnail_resolution = thumbnails[0].get("resolution", "unknown")
-
-                    if not thumbnail_url:
-                        return
-
-                    thumbnail_path = Path(
-                        ROOT_DIR,
-                        "temp",
-                        "thumbnails",
-                        f"thumbnail_{video.id}_{thumbnail_resolution}.jpg"
-                    )
-
-                    if not thumbnail_path.exists():
-                        await asyncio.to_thread(
-                            download_file,
-                            thumbnail_url,
-                            thumbnail_path.as_posix()
-                        )
-
-                    if thumbnail_path.exists():
-                        def apply():
-                            image = Image.open(thumbnail_path.as_posix())
-                            thumbnail = ctk.CTkImage(image, size=(150, 85))
-                            video.apply_thumbnail(thumbnail)
-
-                        root.after(0, lambda func=apply: func())
-
-            async def tasker():
-                await asyncio.gather(
-                    *(inner(video) for video in videos)
-                )
-
-            asyncio.run(tasker())
-
-        def worker():
-            try:
-                playlist_data = fetch_playlist_videos(playlist)
-            except Exception as e:
-                logger.error("Unable to load playlist videos: %s", e)
-                window.after(0, lambda w=window: w.info_label.configure(text=f"Unable to load playlist: {e}"))
-                return
-
-            window.after(0, lambda func=render_videos: func(playlist_data))
-
-        threading.Thread(target=worker, daemon=True).start()
-        window.video_updater = video_info_updater
-
-    # Load playlist when background thread finished playlists data fetch process
-    def build_ui(playlists_data):
-        for widget in playlist_frame.winfo_children():
-            widget.destroy()
-
-        playlists = playlists_data.get("entries", [])
-
-        playlists = [playlist for playlist in playlists if playlist is not None] # ignore None item
-
-        for playlist in playlists:
-            title = playlist.get("title", "Title not found")
-            id = playlist.get("id", "ID not found")
-            if len(playlist.get("thumbnails", [])) > 0:
-                thumbnail_url = playlist.get("thumbnails", [])[0].get('url', None)
-                thumbnail_resolution = playlist.get("thumbnails", [])[0].get('resolution', None)
-
-                thumbnail_path = os.path.join(ROOT_DIR, "temp", "thumbnails",
-                                              f"thumbnail_{id}_{thumbnail_resolution}.jpg")
-
-                result = download_file(thumbnail_url, thumbnail_path)
-
-                if result:
-                    image = Image.open(thumbnail_path)
-                    thumbnail = ctk.CTkImage(image, size=(60, 30))
-                else:
-                    thumbnail = None
-            else:
-                thumbnail = None
-
-            playlist_item = ctk.CTkFrame(playlist_frame, border_width=1, border_color="#666666",
-                                         height=120)
-
-            title_label = ctk.CTkLabel(playlist_item, text=title)
-            title_label.pack(anchor="w", padx=10, pady=10)
-
-            # Don't apply thumbnail if not available
-            if thumbnail:
-                thumbnail_label = ctk.CTkLabel(playlist_item, image=thumbnail, text="")
-                thumbnail_label.pack(anchor="e", padx=5, pady=5)
-
-            bind_click_recursive(playlist_item, lambda _event, current_playlist=playlist: open_playlist_window(current_playlist))
-            playlist_item.pack(padx=5, pady=5, expand=True, fill="x")
-
-    root.mainloop()
 
 if __name__ == "__main__":
     main()
