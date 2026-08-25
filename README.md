@@ -2,6 +2,12 @@
 
 A tool to save your YouTube playlist.
 
+## Features
+
+- Save the playlist from the logged-in YouTube account.
+- Download YouTube video from playlist.
+- Play the video that is inside the playlist using mpv.
+
 ## Run from source
 
 Sync project and install dependencies.
