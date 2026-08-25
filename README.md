@@ -53,7 +53,7 @@ build is performed. Build each target platform on that platform.
 ## Before Use
 
 > [!IMPORTANT]
-> You must configure the secret key before use this tool.
+> You must configure the secret key before use this tool. Is necessary for PlaylistSaver to fetch playlist as your YouTube account)
 
 > [!NOTE]
 > The PlaylistSaverHelper (this tool's Chrome extenstion. Used for transfer YouTube cookie to the main program) haven't listed from the Chrome Extenstion Store. Install via the normal way is impossible.
@@ -85,3 +85,12 @@ build is performed. Build each target platform on that platform.
 
 4. Paste the key to the helper page. Then press `Save key`
 ![Paste the secret key to the helper page. And press "Save key"](https://repo.weispace.net/wei/PlaylistSaver/raw/branch/main/repo_resources/save_key.png)
+
+
+### How to use
+
+On any YouTube page, press `Alt+Y` to open PlaylistSaver. (If Chrome open helper page instead of open the tool. Ensure you have configure the secret key. If not, see section "Before Use: Configure secret key")
+![Open playlistSaver](https://repo.weispace.net/wei/PlaylistSaver/raw/branch/main/repo_resources/open_playlistsaver.png)
+
+Enjoy the tool!
+![Tool Screenshot](https://repo.weispace.net/wei/PlaylistSaver/raw/branch/main/repo_resources/tool_screenshot.png)
