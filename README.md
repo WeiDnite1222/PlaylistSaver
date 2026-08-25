@@ -1,3 +1,5 @@
+<img alt="Prism Launcher" src="/assets/icon.png">
+
 # PlaylistSaver
 
 A tool to save your YouTube playlist.
