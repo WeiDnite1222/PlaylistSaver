@@ -20,6 +20,7 @@ Download this tool from [main repo](https://repo.weispace.net/wei/PlaylistSaver/
 operating system and architecture)
 
 Use any decompress tool to unzip the build file, then open `PlaylistSaver.exe` (For Unix-like system is `PlaylistSaver`)
+
 See `How to use` to get information about how to use this tool.
 
 ## Build
@@ -50,3 +51,22 @@ bundled mpv files matching the operating system and CPU architecture on which th
 build is performed. Build each target platform on that platform.
 
 ## How to use
+
+> [!NOTE]
+> The PlaylistSaverHelper (this tool's Chrome extenstion. Used for transfer YouTube cookie to the main program) haven't listed from the Chrome Extenstion Store. Install via the normal way is impossible.
+
+### Install Chrome extenstion
+
+1. First, download the compressed extenstion `PlaylistSaverHelper.zip` from [release page](https://repo.weispace.net/wei/PlaylistSaver/releases) (or [GitHub mirror](https://repo.weispace.net/wei/PlaylistSaver/releases))
+![Download extenstion](https://repo.weispace.net/wei/PlaylistSaver/raw/branch/main/repo_resources/download_extenstion.png)
+
+2. Unzip the compressed extenstion with any decompress tool.
+![decompress extenstion](https://repo.weispace.net/wei/PlaylistSaver/raw/branch/main/repo_resources/unzip_extenstion.png)
+
+3. Open Chrome and go to `chrome://extensions/`, then click `Open unpacked` button.
+![Open unpacked](https://repo.weispace.net/wei/PlaylistSaver/raw/branch/main/repo_resources/import_unpack.png)
+
+4. Enable the extension.
+![Enable extension](https://repo.weispace.net/wei/PlaylistSaver/raw/branch/main/repo_resources/enable_the_extenstion.png)
+
+
