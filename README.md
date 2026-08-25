@@ -9,11 +9,18 @@ Sync project and install dependencies.
 uv sync
 ```
 
-Run from source:
-
+Activate the virtual environment and run tool with Python:
 ```bash
+.venv/bin/activate # For Windows, use ".\.venv\Scripts\Activate.ps1" or ".\.venv\Scripts\activate.bat"
 python main.py
 ```
+
+# Run from build version
+Download this tool from [main repo](https://repo.weispace.net/wei/PlaylistSaver/releases) or [GitHub mirror](https://github.com/WeiDnite1222/PlaylistSaver) (Ensure the build version you downloaded support you 
+operating system and architecture)
+
+Use any decompress tool to unzip the build file, then open `PlaylistSaver.exe` (For Unix-like system is `PlaylistSaver`)
+See `How to use` to get information about how to use this tool.
 
 ## Build
 
@@ -28,8 +35,14 @@ uv pip install -e ".[build]"
 
 Build this project with PyInstaller:
 
+On Windows, use `build.ps1` script:
 ```powershell
-.\build.ps1 -Clean
+.\build.ps1 -Clean # Or "powershell .\build.ps1 -Clean" if you use cmd
+```
+
+On other platform, run below command to build:
+```bash
+python -m PyInstaller PlaylistSaver.spec
 ```
 
 The build is written to `dist\PlaylistSaver`. This includes only the
