@@ -50,7 +50,10 @@ The build is written to `dist\PlaylistSaver`. This includes only the
 bundled mpv files matching the operating system and CPU architecture on which the
 build is performed. Build each target platform on that platform.
 
-## How to use
+## Before Use
+
+> [!IMPORTANT]
+> You must configure the secret key before use this tool.
 
 > [!NOTE]
 > The PlaylistSaverHelper (this tool's Chrome extenstion. Used for transfer YouTube cookie to the main program) haven't listed from the Chrome Extenstion Store. Install via the normal way is impossible.
@@ -69,4 +72,16 @@ build is performed. Build each target platform on that platform.
 4. Enable the extension.
 ![Enable extension](https://repo.weispace.net/wei/PlaylistSaver/raw/branch/main/repo_resources/enable_the_extenstion.png)
 
+### Configure secret key
 
+1. Open PlaylistSaver, then click `Helper Secret Key`
+![Open tool](https://repo.weispace.net/wei/PlaylistSaver/src/branch/main/repo_resources/open_tool.png)
+
+2. Copy secret key.
+![Copy key](https://repo.weispace.net/wei/PlaylistSaver/raw/branch/main/repo_resources/copy_key.png)
+
+3. Go to YouTube, press `Alt+Z` or click PlaylistSaver icon (on extension list) and click `option` to open helper page.
+![Open Helper via option button](https://repo.weispace.net/wei/PlaylistSaver/raw/branch/main/repo_resources/open_helper_page.png)
+
+4. Paste the key to the helper page. Then press `Save key`
+![Paste the secret key to the helper page. And press "Save key"](https://repo.weispace.net/wei/PlaylistSaver/raw/branch/main/repo_resources/save_key.png)
