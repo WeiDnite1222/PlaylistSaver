@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "playlist-saver"
+dynamic = ["version"]
+description = "A desktop tool for saving YouTube playlists."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "click>=8.1",
+    "platformdirs>=4.0",
+    "PySide6>=6.8",
+    "requests>=2.31",
+    "yt-dlp>=2025.1.15",
+]
+
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.11",
+]
+
+[project.scripts]
+playlist-saver = "main:main"
+
+[tool.setuptools]
+py-modules = [
+    "app",
+    "constant",
+    "dialog",
+    "main",
+    "utils",
+    "widgets",
+    "window",
+    "yt_lib",
+]
+
+[tool.setuptools.packages.find]
+include = ["pl_lib*"]
+namespaces = true
+
+[tool.setuptools.dynamic]
+version = {attr = "constant.VERSION"}
+

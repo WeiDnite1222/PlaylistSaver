@@ -1006,7 +1006,7 @@ def main(url_schema, cookie_file: str):
 
                     thumbnail_path = Path(
                         ROOT_DIR,
-                        "temp",
+                        "../temp",
                         "thumbnails",
                         f"thumbnail_{video.id}_{thumbnail_resolution}.jpg"
                     )

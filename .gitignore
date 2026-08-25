@@ -2,3 +2,9 @@
 /temp/
 /main.build/
 /main.dist/
+/build/
+/dist/
+/*.egg-info/
+/.idea/
+__pycache__/
+*.py[cod]
