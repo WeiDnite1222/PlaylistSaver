@@ -1,0 +1,10 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+body { margin: 0; background: #181818; color: #f2f2f2; }
+main { width: min(620px, calc(100% - 48px)); margin: 64px auto; padding: 28px; background: #242424; border: 1px solid #404040; border-radius: 12px; }
+h1 { margin-top: 0; }
+label { display: block; margin: 24px 0 8px; font-weight: 600; }
+.key-row, .actions { display: flex; gap: 10px; align-items: center; }
+input { flex: 1; min-width: 0; padding: 10px 12px; border: 1px solid #555; border-radius: 7px; font: 14px ui-monospace, monospace; }
+button { padding: 10px 14px; border: 1px solid #666; border-radius: 7px; cursor: pointer; }
+.actions { margin-top: 16px; }
+#status { color: #8bd39a; }

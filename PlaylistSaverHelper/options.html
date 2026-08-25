@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PlaylistSaver Helper Settings</title>
+    <link rel="stylesheet" href="options.css">
+</head>
+<body>
+<main>
+    <h1>PlaylistSaver Helper</h1>
+    <p>Copy the secret key from PlaylistSaver and paste it below.</p>
+    <label for="secretKey">Secret key</label>
+    <div class="key-row">
+        <input id="secretKey" type="password" autocomplete="off" spellcheck="false">
+        <button id="toggleKey" type="button">Show</button>
+    </div>
+    <div class="actions">
+        <button id="saveKey" type="button">Save key</button>
+        <span id="status" role="status"></span>
+    </div>
+</main>
+<script src="options.js"></script>
+</body>
+</html>
